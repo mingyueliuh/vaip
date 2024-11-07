@@ -124,11 +124,14 @@ struct RemoveIdentity {
         PASS_LOG(self, 1) << node_arg_as_string(
             *input_node_arg_of_identity_node);
       }
-      NodeBuilder(graph, self_)
-          .clone_node(node)
-          .set_input_node_args(input_node_args)
-          .set_anchor_point1(node)
-          .build();
+      auto outputs = node_get_output_node_args(node);
+      if (outputs.size() == 1) {
+        NodeBuilder(graph, self_)
+            .clone_node(node)
+            .set_input_node_args(input_node_args)
+            .set_anchor_point1(node)
+            .build();
+      }
     }
   }
   IPass& self_;

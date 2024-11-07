@@ -84,10 +84,6 @@ private:
   const google::protobuf::RepeatedPtrField<MetaSchedule>& output_schedules_;
   std::unique_ptr<RunnerRequestsQueue> runnerRequestsQueue_;
   bool share_context_;
-  mutable std::string perf_pref_run_cached_;
-  mutable std::string perf_pref_session_cached_;
-  // for XRT driver backward compatibility in non share context model
-  bool vart_support_eff_mode_;
 };
 
 struct RunnerHolder {

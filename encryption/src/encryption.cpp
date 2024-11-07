@@ -44,6 +44,9 @@
 namespace vaip_encryption {
 std::string aes_encryption(const std::string& str, const std::string& key) {
 #ifdef WITH_OPENSSL
+  if (key.size() * 8 != 256) {
+    throw std::runtime_error("key size should be 256 bits");
+  }
   EVP_CIPHER_CTX* ctx;
   if (!(ctx = EVP_CIPHER_CTX_new())) {
     throw std::runtime_error("encryption creating context failed");
@@ -79,6 +82,9 @@ std::string aes_encryption(const std::string& str, const std::string& key) {
 
 std::string aes_decryption(const std::string& str, const std::string& key) {
 #ifdef WITH_OPENSSL
+  if (key.size() * 8 != 256) {
+    throw std::runtime_error("key size should be 256 bits");
+  }
   EVP_CIPHER_CTX* ctx;
   if (!(ctx = EVP_CIPHER_CTX_new())) {
     throw std::runtime_error("decryption creating context failed");

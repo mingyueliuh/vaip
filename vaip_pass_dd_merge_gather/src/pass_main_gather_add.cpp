@@ -132,21 +132,10 @@ struct Dd_merge_gather_add {
           auto log_dir = self->get_log_path();
           std::string name = node_arg_get_name(*input_data_node.node_arg);
           auto data_bin = get_file_name(name);
-          bool in_mem = self_.get_context()->cache_in_mem();
-          if (in_mem) {
-            auto char_data = gsl::span<const char>(
-                reinterpret_cast<const char*>(in_data.data()),
-                in_data.size() * sizeof(uint8_t));
-            self_.get_context()->write_file(data_bin, char_data);
-          } else {
-            auto path = log_dir / data_bin;
-            std::string data_file{path.u8string()};
-            std::ofstream file(data_file, std::ios::binary);
-            file.write(reinterpret_cast<const char*>(in_data.data()),
-                       in_data.size() * sizeof(uint8_t));
-
-            file.close();
-          }
+          auto char_data = gsl::span<const char>(
+              reinterpret_cast<const char*>(in_data.data()),
+              in_data.size() * sizeof(uint8_t));
+          self_.get_context()->write_file(data_bin, char_data);
 
           std::string wts_file;
           auto const_inp_node = binder[const_inp->get_id()];
@@ -159,19 +148,11 @@ struct Dd_merge_gather_add {
 
           std::string wname = node_arg_get_name(*const_inp_node.node_arg);
           auto wts_bin = get_file_name(wname);
-          if (in_mem) {
-            auto char_data = gsl::span<const char>(
-                reinterpret_cast<const char*>(wts_data.data()),
-                wts_data.size() * sizeof(uint8_t));
-            self_.get_context()->write_file(wts_bin, char_data);
-          } else {
-            auto path2 = log_dir / wts_bin;
-            std::string wts_data_file{path2.u8string()};
-            std::ofstream file2(wts_data_file, std::ios::binary);
-            file2.write(reinterpret_cast<const char*>(wts_data.data()),
-                        wts_data.size() * sizeof(uint8_t));
-            file2.close();
-          }
+          char_data = gsl::span<const char>(
+              reinterpret_cast<const char*>(wts_data.data()),
+              wts_data.size() * sizeof(uint8_t));
+          self_.get_context()->write_file(wts_bin, char_data);
+
           auto act_sc = node_arg_get_const_data_as_float(
               *graph, *act_scale_node.node_arg);
           auto act_zp =

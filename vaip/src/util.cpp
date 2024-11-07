@@ -364,11 +364,11 @@ template <typename T> struct zlib {
     CHECK_EQ((size_t)status, data.size()) << "gzwrite error";
     status = gzflush(gzfile, Z_FINISH);
     CHECK_EQ(status, 0) << "gzflush error";
-    status = std::fseek(tmp_file, 0, SEEK_END);
+    status = fseek64(tmp_file, 0, SEEK_END);
     CHECK(status == 0) << "fseek error";
-    auto size = std::ftell(tmp_file);
+    auto size = ftell64(tmp_file);
     CHECK_NE(size, -1) << "ftell error";
-    status = std::fseek(tmp_file, 0, SEEK_SET);
+    status = fseek64(tmp_file, 0, SEEK_SET);
     auto output_buffer = std::vector<char_type>((size_t)size);
     auto read_size =
         std::fread(output_buffer.data(), 1, output_buffer.size(), tmp_file);
@@ -390,7 +390,7 @@ template <typename T> struct zlib {
     auto write_size = std::fwrite(data.data(), 1, data.size(), tmp_file);
     CHECK_EQ((size_t)write_size, data.size());
     err = fflush(tmp_file);
-    auto status = std::fseek(tmp_file, 0, SEEK_SET);
+    auto status = fseek64(tmp_file, 0, SEEK_SET);
     CHECK_EQ(status, 0) << "fseek error";
     CHECK_EQ(err, 0) << "fflush error";
 #if _WIN32

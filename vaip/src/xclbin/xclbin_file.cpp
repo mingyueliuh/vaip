@@ -100,18 +100,14 @@ get_xclbin_fingerprint(const vaip_core::PassContext& pass_context,
   auto basename = filename.filename();
   auto stream = std::unique_ptr<std::istream>();
   auto buffer = std::string();
-  if (auto content = pass_context.read_file_c8(basename.u8string())) {
-    buffer.assign(content->begin(), content->end());
-    auto p = new std::istringstream(buffer);
-    stream = std::unique_ptr<std::istream>(p);
-  } else {
-    stream = std::unique_ptr<std::istream>(
-        new std::fstream(filename, std::ifstream::in | std::ifstream::binary));
-    if (!stream->good()) {
-      LOG(ERROR) << "Failed to open xclbin " << filename;
-      return std::nullopt;
-    }
+  auto content = pass_context.read_file_c8(basename.u8string());
+  if (!content.has_value()) {
+    LOG(ERROR) << "Failed to open xclbin " << filename;
+    return std::nullopt;
   }
+  buffer.assign(content->begin(), content->end());
+  auto p = new std::istringstream(buffer);
+  stream = std::unique_ptr<std::istream>(p);
   auto hdr = get_hdr(*stream, filename.u8string());
   auto section_hdr = get_section_hdr(*stream, hdr, AIE_PARTITION);
   auto fingerprint = get_fingerprint(*stream, section_hdr);

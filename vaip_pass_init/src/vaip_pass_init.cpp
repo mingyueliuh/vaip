@@ -53,7 +53,7 @@ struct InitPass {
       auto file = log_dir / "onnx.onnx";
       auto dat_file = "onnx.dat";
       VAIP_ORT_API(graph_save)
-      (graph, file.u8string(), dat_file, 128u);
+      (graph, file.u8string(), dat_file, std::numeric_limits<size_t>::max());
       LOG(INFO) << "save origin onnx model to " << file << " data in "
                 << dat_file;
     }

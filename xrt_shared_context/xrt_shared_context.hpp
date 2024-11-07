@@ -248,10 +248,6 @@ public:
   // https://gitenterprise.xilinx.com/VitisAI/graph-engine/blob/c4e1132b0c9d05a47dab3175d9dc9d6ed878522b/src/graph-engine/graph_runner.hpp#L96-L108
   void update_qos(std::map<std::string, std::uint32_t> qos) {
 
-    if (!support_eff_mode_) {
-      qos.erase("perf_pref");
-    }
-
     merge_qos_ = qos;
     if (init_qos_) {
       latency_ = qos["latency"];
@@ -272,17 +268,6 @@ public:
       xrt_hw_context_->update_qos(merge_qos_);
     }
     return;
-  }
-
-  void update_qos_for_run_opt(const std::string& perf_pref_value) {
-    // Note(ltp): local copy to ensure thread safe.
-    // The overhead should be cheap.
-    // Note(xcl) if efficient model is supported in XRT driver, do nothing
-    if (support_eff_mode_) {
-      auto merge_qos = merge_qos_;
-      merge_qos["perf_pref"] = perf_pref_value == "Efficient" ? 1 : 0;
-      xrt_hw_context_->update_qos(merge_qos);
-    }
   }
 
 private:

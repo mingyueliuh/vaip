@@ -38,6 +38,15 @@
 #include <sstream>
 #include <vaip/my_ort.h>
 #include <vaip/vaip_gsl.h>
+
+#ifdef _WIN32
+#  define fseek64 _fseeki64
+#  define ftell64 _ftelli64
+#else
+#  define fseek64 fseeko
+#  define ftell64 ftello
+#endif
+
 namespace vaip_core {
 VAIP_DLL_SPEC void dump_graph(const Graph& graph, const std::string& filename);
 template <typename T> std::string container_as_string(const T& container) {

@@ -45,7 +45,6 @@ static vaip_core::ExecutionProvider* create_execution_provider_imp(
 
   auto& session_option = context->get_config_proto().provider_options();
   auto model_version_ = session_option.at("model_name");
-  printf("entered custom op creation");
   if (model_version_ == "GT_v1.2") {
     return new vaip_core::ExecutionProviderImp<
         vaip_vaiml_custom_op::MyCustomOpGT1_2>(context, meta_def);

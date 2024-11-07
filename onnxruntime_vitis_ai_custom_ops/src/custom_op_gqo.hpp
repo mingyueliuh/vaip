@@ -120,6 +120,12 @@ struct GQOAIEKernelInfo {
     return S_padded;
   }
 
+  int64_t try_pad_total_seq(int64_t T) const {
+    assert(T > 0 && T < MAX_SEQ_LENGTH);
+    int64_t T_padded = T;
+    T_padded = ((int)(T / 128) + 1) * 128;
+    return T_padded;
+  }
   // check if the seq_len is supported by aie
   bool is_seq_aie_supported(int seq_len) const {
     return (supported_seqlen.find(seq_len) != supported_seqlen.end());
@@ -160,23 +166,22 @@ public:
   void LazyInit_matmul_nbits(std::vector<int8_t> b, std::vector<int8_t> zeros,
                              std::vector<float> scales,
                              std::vector<float> bias);
-  // void initialize_matmul_nbits(const OrtKernelInfo* k_info);
-  void MyCustomOpKernel::rope_aie_execute(const uint16_t* input,
-                                          uint16_t* output, const int N,
-                                          const int S, const int H);
+
   void MyCustomOpKernel::matmul_nbits_aie_execute1(
-      const uint16_t* input_data, uint16_t* out,
-      std::vector<int64_t> input_shape, std::vector<int> wts_shape,
-      int grp_size, int run_cnt);
+      uint16_t* input_data, uint16_t* out, std::vector<int64_t> input_shape,
+      std::vector<int> wts_shape, int grp_size, int run_cnt);
   void MyCustomOpKernel::matmul_nbits_aie_execute(
       std::vector<xrt::bo>& inputs, uint16_t* out,
       std::vector<int64_t> output_shape, std::vector<int> wts_shape,
       int grp_size, int run_cnt);
-  void aie_execute(OrtTensor& query_states, OrtTensor& key_states,
-                   OrtTensor& value_states, OrtTensor& attention_mask,
-                   OrtTensor& output);
-  void aie_execute(OrtTensor& query_states, OrtTensor& key_states,
-                   OrtTensor& value_states, OrtTensor& attention_mask);
+  void aie_execute_rope(const uint16_t* input, uint16_t* output, const int N,
+                        const int S, const int H, const int past_S = 0);
+  void aie_execute_mha(uint16_t* output, const int N_q, const int N_kv,
+                       const int S, const int S_pad, const int H);
+  void aie_execute_rope_mha(uint16_t* output, const int N_q, const int N_kv,
+                            const int S, const int S_pad, const int H);
+  void aie_execute_token(uint16_t* output, int N_q, int N_kv, int S, int T,
+                         int H);
   void transpose0213(uint16_t* output_data, uint16_t* input_data, int D0,
                      int D1, int D2, int D3, OrtKernelContext* context);
   void get_rope_cache(Ort::ConstValue& cos_tensor, Ort::ConstValue& sin_tensor);
@@ -207,14 +212,22 @@ private:
   ryzenai::bmm<uint16_t, uint16_t, uint16_t>* bmm1_{nullptr};
   ryzenai::masked_softmax<uint16_t, uint16_t, uint16_t>* softmax_{nullptr};
   ryzenai::bmm<uint16_t, uint16_t, uint16_t>* bmm2_{nullptr};
-  ryzenai::mha_rope<uint16_t, uint16_t, uint16_t>* rope_{nullptr};
+  ryzenai::mha_rope<uint16_t, uint16_t, uint16_t>* rope_q_{nullptr};
+  ryzenai::mha_rope<uint16_t, uint16_t, uint16_t>* rope_k_{nullptr};
   // aie kernel bos
+  std::vector<xrt::bo> rope_q_inputs;
+  std::vector<xrt::bo> rope_q_outputs;
+  std::vector<xrt::bo> rope_k_inputs;
+  std::vector<xrt::bo> rope_k_outputs;
   std::vector<xrt::bo> bmm1_inputs;
   std::vector<xrt::bo> bmm1_outputs;
   std::vector<xrt::bo> bmm2_inputs;
   std::vector<xrt::bo> bmm2_outputs;
+  std::vector<xrt::bo> sm_inputs;
   std::vector<xrt::bo> mm_outputs;
+  xrt::bo softmax_input;
   xrt::bo softmax_mask;
+  xrt::bo softmax_output;
   std::vector<xrt::bo> rope_inputs_, rope_outputs_;
   /// RoPE
   static int compute_instances__;
@@ -265,6 +278,7 @@ public:
     AIE_K_T,
     AIE_V_T,
     AIE_Q_ROPE,
+    AIE_K_ROPE,
     AIE_K_T_P,
     AIE_ROPE_OR_PAD,
     AIE_V_T_P,
@@ -350,6 +364,7 @@ private:
   const size_t min_aie_k_t_size_ = 2048 * 1024 * sizeof(uint16_t);
   const size_t min_aie_v_t_size_ = 2048 * 1024 * sizeof(uint16_t);
   const size_t min_aie_q_rope_size_ = 2048 * 4096 * sizeof(uint16_t);
+  const size_t min_aie_k_rope_size_ = 2048 * 4096 * sizeof(uint16_t);
   const size_t min_aie_k_t_p_size_ = 2048 * 4096 * sizeof(uint16_t);
   const size_t min_aie_rope_or_pad_size_ = 2048 * 4096 * sizeof(uint16_t);
   const size_t min_aie_v_t_p_size_ = 2048 * 4096 * sizeof(uint16_t);
@@ -365,7 +380,7 @@ private:
   const size_t min_f_q_rope_size_ = 2048 * 4096 * sizeof(float);
   const size_t min_f_k_size_ = 2048 * 1024 * sizeof(float);
   const size_t min_f_k_rope_size_ = 2048 * 1024 * sizeof(float);
-
+  /// Ort
   const size_t min_q_size_ = 1 * 4096 * sizeof(float);
   const size_t min_k_size_ = 1 * 1024 * sizeof(float);
   const size_t min_v_size_ = 1 * 1024 * sizeof(float);
@@ -377,6 +392,7 @@ private:
 
   // Buffer map to associate BufferType with BufferMeta
   std::unordered_map<BufferType, BufferMeta> buffer_map_{
+      /// AIE Prefill
       {BufferType::AIE_Q, {{nullptr, 0}, min_aie_q_size_}},
       {BufferType::AIE_K, {{nullptr, 0}, min_aie_k_size_}},
       {BufferType::AIE_V, {{nullptr, 0}, min_aie_v_size_}},
@@ -384,6 +400,7 @@ private:
       {BufferType::AIE_K_T, {{nullptr, 0}, min_aie_k_t_size_}},
       {BufferType::AIE_V_T, {{nullptr, 0}, min_aie_v_t_size_}},
       {BufferType::AIE_Q_ROPE, {{nullptr, 0}, min_aie_q_rope_size_}},
+      {BufferType::AIE_K_ROPE, {{nullptr, 0}, min_aie_k_rope_size_}},
       {BufferType::AIE_K_T_P, {{nullptr, 0}, min_aie_k_t_p_size_}},
       {BufferType::AIE_ROPE_OR_PAD, {{nullptr, 0}, min_aie_rope_or_pad_size_}},
       {BufferType::AIE_V_T_P, {{nullptr, 0}, min_aie_v_t_p_size_}},
@@ -397,6 +414,7 @@ private:
       {BufferType::AIE_F_Q_ROPE, {{nullptr, 0}, min_f_q_rope_size_}},
       {BufferType::AIE_F_K, {{nullptr, 0}, min_f_k_size_}},
       {BufferType::AIE_F_K_ROPE, {{nullptr, 0}, min_f_k_rope_size_}},
+      /// ORT
       {BufferType::ORT_Q, {{nullptr, 0}, min_q_size_}},
       {BufferType::ORT_K, {{nullptr, 0}, min_k_size_}},
       {BufferType::ORT_V, {{nullptr, 0}, min_v_size_}},

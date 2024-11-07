@@ -115,15 +115,7 @@ static void save_xmodel(const xir::Graph& graph, const std::string& filename,
   if (key != "") {
     s = vaip_encryption::aes_encryption(s, key);
   }
-  bool is_in_mem = context->cache_in_mem();
-  if (is_in_mem) {
-    context->write_file(std::filesystem::path(filename).filename().u8string(),
-                        s);
-  } else {
-    std::ofstream ofs(filename, std::ios::binary | std::ios::trunc);
-    ofs << s;
-    ofs.close();
-  }
+  context->write_file(std::filesystem::path(filename).filename().u8string(), s);
 }
 static std::unique_ptr<xir::Graph> load_xmodel(const std::string& filename,
                                                const IPass& pass) {

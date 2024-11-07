@@ -304,7 +304,7 @@ else(MSVC)
 endif(MSVC)
 
 vai_add_debug_command(core
-    COMMAND "$ENV{PREFIX}\\bin\\test_onnx_runner.exe"
-    ARGUMENTS "C:\\Users\\$ENV{USERNAME}\\build\\vaip_regression\\K1\\K1_v_0_1_quantized_nhwc.onnx"
+    COMMAND "${CMAKE_INSTALL_PREFIX}\\bin\\test_onnx_runner.exe"
+    ARGUMENTS "${CMAKE_CURRENT_SOURCE_DIR}\\..\\..\\test_onnx_runner\\data\\pt_resnet50.onnx"
     ENVIRONMENT DEBUG_DD_MERGE_QMHAGRPB=1
   )

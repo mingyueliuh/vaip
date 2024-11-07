@@ -57,28 +57,18 @@ MyCustomOp::MyCustomOp(std::shared_ptr<const PassContext> context,
       std::filesystem::path(data_file).filename().string());
   auto zp_file_opt =
       context->read_file_c8(std::filesystem::path(zp_file).filename().string());
-  if (data_file_opt.has_value() && zp_file_opt.has_value()) {
-    auto file = data_file_opt.value();
-    in_data.resize(file.size() / sizeof(int8_t));
-    memcpy(in_data.data(), file.data(), file.size());
-
-    auto file_zp = zp_file_opt.value();
-    zp = *reinterpret_cast<const int8_t*>(file_zp.data());
-  } else {
-    std::ifstream file(data_file, std::ios::binary);
-    file.seekg(0, std::ios::end);
-    std::streamsize size = file.tellg();
-    file.seekg(0, std::ios::beg);
-    in_data.resize(size / sizeof(int8_t));
-    if (!file.read(reinterpret_cast<char*>(in_data.data()), size)) {
-      std::cerr << "Error reading file!" << std::endl;
-    }
-    file.close();
-
-    std::ifstream file_zp(zp_file, std::ios::binary);
-    file_zp.read(reinterpret_cast<char*>(&zp), sizeof(zp));
-    file_zp.close();
+  if (!data_file_opt.has_value()) {
+    std::cerr << "Error reading file: " << data_file << std::endl;
   }
+  if (!zp_file_opt.has_value()) {
+    std::cerr << "Error reading file: " << zp_file << std::endl;
+  }
+  auto file = data_file_opt.value();
+  in_data.resize(file.size() / sizeof(int8_t));
+  memcpy(in_data.data(), file.data(), file.size());
+
+  auto file_zp = zp_file_opt.value();
+  zp = *reinterpret_cast<const int8_t*>(file_zp.data());
 
   size_t input_size = ifm_dim_0 * ifm_dim_1;
   in_dq.resize(input_size);

@@ -66,6 +66,7 @@ std::vector<std::vector<int>> n_sizes_;
 DEF_ENV_PARAM(DEBUG_MHA_CUSTOM_OP, "0")
 DEF_ENV_PARAM(USE_AIE_GQO, "1")
 DEF_ENV_PARAM(USE_AIE_RoPE, "1")
+DEF_ENV_PARAM(USE_AIE_TOKEN, "0")
 DEF_ENV_PARAM(MHA_PARALLEL_BATCH, "1")
 DEF_ENV_PARAM_2(MLADF_VERSION, "v1", std::string)
 #define MY_LOG(n) LOG_IF(INFO, ENV_PARAM(DEBUG_MHA_CUSTOM_OP) >= n)
@@ -199,71 +200,39 @@ void MyCustomOpKernel::transpose0213(uint16_t* output_data,
   transpose0213_built_in.Invoke(context, inputs, 1, outputs, 1);
 }
 
-// slice [1, 1, S1, S2] from [1, N, S1, S2]
-template <typename T>
-static void slice_tensor_loop(const T* input_tensor, int B, int N, int S1,
-                              int S2, T* output_tensor) {
-  int slice_size = S1 * S2;
-  for (int b = 0; b < B; b++) {
-    std::memcpy(output_tensor + b * slice_size,
-                input_tensor + b * N * slice_size, slice_size * sizeof(T));
-  }
-}
-
 inline bool check_prefill(int seq_len) { return (seq_len != 1); }
 
-// free buffer if data_ptr is not null
-template <typename T>
-void free_buffer(Ort::AllocatorWithDefaultOptions& allocator, T* data_ptr) {
-  if (data_ptr != nullptr) {
-    allocator.Free(data_ptr);
-  }
-}
-
-// pad qkv to qkv_padded with 0
-void pad_qkv(uint16_t* t, uint16_t* t_padded, int64_t seqlen,
-             int64_t seqlen_padded, int64_t num_heads, int64_t head_size) {
-  std::memset(t_padded, 0,
-              num_heads * seqlen_padded * head_size * sizeof(uint16_t));
-  for (int64_t n = 0; n < num_heads; n++) {
-    std::memcpy(t_padded + n * seqlen_padded * head_size,
-                t + n * seqlen * head_size,
-                seqlen * head_size * sizeof(uint16_t));
-  }
-}
-
-// pad s to s_padded with neg_inf_ui16
-void pad_rpb(uint16_t* t, uint16_t* t_padded, int64_t seqlen,
-             int64_t seqlen_padded) {
-  const uint16_t neg_inf_ui16 = float_to_bfloat16(-3.389e38f);
-  for (int64_t s = 0; s < seqlen; s++) {
-    std::memcpy(t_padded + s * seqlen_padded, t + s * seqlen,
-                seqlen * sizeof(uint16_t));
-    // pad s to s_padded with neg_inf_ui16
-    for (int64_t s1 = seqlen; s1 < seqlen_padded; s1++) {
-      t_padded[s * seqlen_padded + s1] = neg_inf_ui16;
-    }
-  }
-  for (int64_t s = seqlen; s < seqlen_padded; s++) {
-    for (int64_t s1 = 0; s1 < seqlen_padded; s1++) {
-      t_padded[s * seqlen_padded + s1] = neg_inf_ui16;
-    }
-  }
-}
-
-// slice the actual output from padded output
-void slice_output(uint16_t* output_padded, uint16_t* output, int64_t seqlen,
-                  int64_t seqlen_padded, int64_t num_heads, int64_t head_size,
-                  std::string version = "v0") {
-  if (version == "v0") {
-    for (int64_t n = 0; n < num_heads; n++) {
-      std::memcpy(output + n * seqlen * head_size,
-                  output_padded + n * seqlen_padded * head_size,
-                  seqlen * head_size * sizeof(uint16_t));
+// Try pad qkv from [B, N, S, H] to [B, N, S_pad, H] with 0
+void try_pad_qkv(uint16_t* dst, uint16_t* src, int64_t N, int64_t S,
+                 int64_t S_pad, int64_t H) {
+  if (S != S_pad) {
+    std::memset(dst, 0, N * S_pad * H * sizeof(uint16_t));
+    for (int64_t n = 0; n < N; n++) {
+      std::memcpy(dst + n * S_pad * H, src + n * S * H,
+                  S * H * sizeof(uint16_t));
     }
   } else {
-    std::memcpy(output, output_padded,
-                seqlen * num_heads * head_size * sizeof(uint16_t));
+    std::memcpy(dst, src, N * S * H * sizeof(uint16_t));
+  }
+}
+
+// Try pad mask from [S, S] to [S_pad, S_pad] with neg_inf_ui16
+void try_pad_mask(uint16_t* dst, uint16_t* src, int64_t S, int64_t S_pad) {
+  if (S != S_pad) {
+    const uint16_t neg_inf_ui16 = float_to_bfloat16(-3.389e38f);
+    for (int64_t s = 0; s < S; s++) {
+      std::memcpy(dst + s * S_pad, src + s * S, S * sizeof(uint16_t));
+      for (int64_t s1 = S; s1 < S_pad; s1++) {
+        dst[s * S_pad + s1] = neg_inf_ui16;
+      }
+    }
+    for (int64_t s = S; s < S_pad; s++) {
+      for (int64_t s1 = 0; s1 < S_pad; s1++) {
+        dst[s * S_pad + s1] = neg_inf_ui16;
+      }
+    }
+  } else {
+    std::memcpy(dst, src, S * S * sizeof(uint16_t));
   }
 }
 
@@ -309,35 +278,60 @@ void MyCustomOpKernel::RoPE(float* output_data, float* input_data,
   MY_LOG(2) << "RoPE done." << std::endl;
 }
 
-/// @brief  pad k/v from [B, N_kv, S, H] to [B, N_q, S, H]
-/// @param dst padded k/v
-/// @param src k/v to pad
-void pad_group_kv(uint16_t* dst, uint16_t* src, int q_num_head, int kv_num_head,
-                  int seq_len, int head_size) {
-  int copy_size = seq_len * head_size;
-  int num_group = q_num_head / kv_num_head;
-  for (int n = 0; n < kv_num_head; n++) {
-    for (int g = 0; g < num_group; g++) {
-      std::memcpy(dst + (n * num_group + g) * copy_size, src + n * copy_size,
-                  copy_size * sizeof(uint16_t));
+///
+/// @brief concat past and current, then pad (B = 1)
+///
+/// @param dst      : shape [B, N_kv, T_pad, H]
+/// @param past     : shape [B, N_kv, past_S, H]
+/// @param current  : shape [B, N_kv, 1, H]
+/// @param share_buffer: past_present_share_buffer flag
+///
+/// @note
+/// 1. concat pask_v with current_v to total_v:
+///       [B, N_kv, past_S, H] + [B, N_kv,1, H] -> [B, N_kv, T, H], where T =
+///       past_S + 1
+/// 2. pad 3rd dim of total_v to multiples of 128:
+///       [B, N_kv, T, H] to [B, N_kv, T_pad, H], where T_pad is multiples of
+///       128
+///
+///
+void pad_concat_kv(uint16_t* dst, uint16_t* past, uint16_t* current, int N_kv,
+                   int T, int T_pad, int H, bool share_buffer) {
+  std::memset(dst, 0, N_kv * T_pad * H * sizeof(uint16_t));
+  int past_S = T - 1;
+  /// if past_presenst_share_buffer is true, S stride will be 4096
+  int past_s_stride = share_buffer ? 4096 : past_S;
+  for (int n = 0; n < N_kv; n++) {
+    /// copy past v past_S times, each time copy H elements
+    for (int s = 0; s < past_S; s++) {
+      std::memcpy(dst + n * T_pad * H + s * H,
+                  past + n * past_s_stride * H + s * H, H * sizeof(uint16_t));
     }
+    /// pad v and concat new v with past v
+    std::memcpy(dst + n * T_pad * H + past_S * H, current + n * 1 * H,
+                H * sizeof(uint16_t));
   }
 }
 
-void pad_group_kv_BSNH(uint16_t* dst, uint16_t* src, int q_num_head,
-                       int kv_num_head, int seq_len, int head_size) {
-  int copy_size = head_size;
-  int num_group = q_num_head / kv_num_head;
-  for (int s = 0; s < seq_len; s++) {
-    for (int n = 0; n < kv_num_head; n++) {
-      for (int g = 0; g < num_group; g++) {
-        std::memcpy(dst + s * q_num_head * head_size +
-                        (n * num_group + g) * copy_size,
-                    src + s * kv_num_head * head_size + n * copy_size,
-                    copy_size * sizeof(uint16_t));
-      }
-    }
+void fill_attn_mask_token(uint16_t* atten_mask, int T, int T_pad) {
+  //(B,1,1,T) -> (B,1, T,T) //
+  // std::memset(atten_mask, 0, T_pad * T_pad * sizeof(uint16_t));
+  std::memset(atten_mask, 0, 128 * T_pad * sizeof(uint16_t));
+  const uint16_t neg_inf_ui16 = float_to_bfloat16(-3.389e38f);
+#ifdef _WIN32
+  __stosw(atten_mask + T, neg_inf_ui16, T_pad - T);
+
+  for (int t = 1; t < 128; t++) {
+    __stosw(atten_mask + t * T_pad, neg_inf_ui16, T_pad);
   }
+#else
+  std::fill(atten_mask + T, atten_mask + T_pad, neg_inf_ui16);
+
+  for (int t = 1; t < 128; t++) {
+    std::fill(atten_mask + t * T_pad, atten_mask + (t + 1) * T_pad,
+              neg_inf_ui16);
+  }
+#endif
 }
 
 void MyCustomOpKernel::set_params() {
@@ -350,11 +344,11 @@ void MyCustomOpKernel::set_params() {
 }
 
 void MyCustomOpKernel::LazyInit() {
-  mladf_version_ = ENV_PARAM(MLADF_VERSION);
   dry_run_ = 0;
   if (ENV_PARAM(DRY_RUN) == 1)
     dry_run_ = 1;
 
+  mladf_version_ = ENV_PARAM(MLADF_VERSION);
   std::map<std::string, std::any> attr = {{"op_version", mladf_version_}};
   MY_LOG(2) << "MLADF_VERSION: " << mladf_version_ << std::endl;
   static ryzenai::bmm<uint16_t, uint16_t, uint16_t> bmm1 =
@@ -373,13 +367,20 @@ void MyCustomOpKernel::LazyInit() {
   std::string transpose_type = "input";
   std::map<std::string, std::any> rope_attr = {{"op_version", mladf_version_},
                                                {"transpose", transpose_type}};
-  static ryzenai::mha_rope<uint16_t, uint16_t, uint16_t> mha_rope =
+  static ryzenai::mha_rope<uint16_t, uint16_t, uint16_t> mha_rope_q =
       ryzenai::mha_rope<uint16_t, uint16_t, uint16_t>("bfloat16", true,
                                                       rope_attr);
-
-  if (rope_ == nullptr) {
-    rope_ = &mha_rope;
+  static ryzenai::mha_rope<uint16_t, uint16_t, uint16_t> mha_rope_k =
+      ryzenai::mha_rope<uint16_t, uint16_t, uint16_t>("bfloat16", true,
+                                                      rope_attr);
+  if (rope_q_ == nullptr) {
+    rope_q_ = &mha_rope_q;
   }
+
+  if (rope_k_ == nullptr) {
+    rope_k_ = &mha_rope_k;
+  }
+
   if (bmm1_ == nullptr) {
     bmm1_ = &bmm1;
   }
@@ -580,6 +581,10 @@ MyCustomOpKernel::MyCustomOpKernel(const OrtKernelInfo* k_info,
     bmm1_->debug(false);
     bmm2_->debug(false);
     softmax_->debug(false);
+    rope_q_inputs = rope_q_->get_inputs();
+    rope_q_outputs = rope_q_->get_outputs();
+    rope_k_inputs = rope_k_->get_inputs();
+    rope_k_outputs = rope_k_->get_outputs();
     bmm1_inputs = bmm1_->get_inputs();
     bmm1_outputs = bmm1_->get_outputs();
     bmm2_inputs = bmm2_->get_inputs();
@@ -713,47 +718,8 @@ MyCustomOpKernel::~MyCustomOpKernel() {
 #endif
 }
 
-void MyCustomOpKernel::rope_aie_execute(const uint16_t* input, uint16_t* output,
-                                        const int N, const int S, const int H) {
-  std::vector<size_t> in_shape{(size_t)N, (size_t)S, (size_t)H};
-  rope_->set_params("rope", in_shape);
-  std::vector<xrt::bo> rope_inbos = rope_->get_inputs();
-  std::vector<xrt::bo> rope_outbos = rope_->get_outputs();
-
-  MY_LOG(2) << "aie rope begin." << std::endl;
-  MY_LOG(2) << "S: " << S << std::endl;
-  MY_LOG(2) << "H: " << H << std::endl;
-  MY_LOG(2) << "copy input." << std::endl;
-  uint16_t* a_bo_map = rope_inbos[0].map<uint16_t*>();
-  memcpy((void*)a_bo_map, (void*)input, N * S * H * sizeof(uint16_t));
-
-  uint16_t* b_bo_map = rope_inbos[1].map<uint16_t*>();
-  auto trig_max_len_offset = 2 * max_seq_length * cs_1;
-  auto b_bo_map_offset = S * H;
-  MY_LOG(2) << "copy cos." << std::endl;
-  memcpy((void*)b_bo_map, (void*)cos_sin_cache__.get(),
-         S * H * sizeof(uint16_t));
-  MY_LOG(2) << "copy sin." << std::endl;
-  memcpy((void*)(b_bo_map + b_bo_map_offset),
-         (void*)(cos_sin_cache__.get() + trig_max_len_offset),
-         S * H * sizeof(uint16_t));
-
-  uint16_t* rope_out = rope_outbos[0].map<uint16_t*>();
-  rope_inbos[0].sync(XCL_BO_SYNC_BO_TO_DEVICE);
-  rope_inbos[1].sync(XCL_BO_SYNC_BO_TO_DEVICE);
-  MY_LOG(2) << "aie execute." << std::endl;
-  TRY_EXECUTE_WITH_LOG(
-      rope_->execute(rope_inbos, rope_outbos), dry_run_,
-      ReportInventory::getInstance().addData, "mha_rope_" + std::to_string(S),
-      std::to_string(N) + "_" + std::to_string(S) + "_" + std::to_string(H));
-  rope_outbos[0].sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-  MY_LOG(2) << "copy output." << std::endl;
-  memcpy(output, rope_out, N * S * H * sizeof(uint16_t));
-  MY_LOG(2) << "aie rope done." << std::endl;
-}
-
 void MyCustomOpKernel::matmul_nbits_aie_execute1(
-    const uint16_t* input_data, uint16_t* out, std::vector<int64_t> input_shape,
+    uint16_t* input_data, uint16_t* out, std::vector<int64_t> input_shape,
     std::vector<int> wts_shape, int grp_size, int run_cnt) {
   auto ptr = (ryzenai::mladfmatmulbias<uint16_t, int8_t, uint16_t, uint16_t>*)
                  gemm__.get();
@@ -829,71 +795,84 @@ void MyCustomOpKernel::matmul_nbits_aie_execute(
   MY_LOG(2) << "aie mm_nbits done." << std::endl;
 }
 
-void MyCustomOpKernel::aie_execute(OrtTensor& query_states,
-                                   OrtTensor& key_states,
-                                   OrtTensor& value_states,
-                                   OrtTensor& attention_mask,
-                                   OrtTensor& output) {
-  // Code taken from:
-  // https://gitenterprise.xilinx.com/VitisAI/transformers/blob/main/ops/torch_cpp/src/mha_npu_torch.cpp#L41
+void MyCustomOpKernel::aie_execute_rope(const uint16_t* input, uint16_t* output,
+                                        const int N, const int S, const int H,
+                                        const int past_S) {
+  std::vector<size_t> in_shape{(size_t)N, (size_t)S, (size_t)H};
+  rope_q_->set_params("rope", in_shape);
+  std::vector<xrt::bo> rope_inbos = rope_q_->get_inputs();
+  std::vector<xrt::bo> rope_outbos = rope_q_->get_outputs();
 
-  // Get Shapes
-  int B = query_states.shape[0];   // Batch
-  int N = query_states.shape[1];   // Number of heads
-  int S_q = query_states.shape[2]; // Sequence length of query
-  int H = query_states.shape[3];   // Head_size
-  int S_k = key_states.shape[2];   // Sequence length of key
+  MY_LOG(2) << "aie rope begin." << std::endl;
+  MY_LOG(2) << "NxSxH: " << N << "x" << S << "x" << H << std::endl;
+  MY_LOG(2) << "copy input." << std::endl;
+  uint16_t* a_bo_map = rope_inbos[0].map<uint16_t*>();
+  memcpy((void*)a_bo_map, (void*)input, N * S * H * sizeof(uint16_t));
 
-  // Get data pointers
-  auto xCasted = static_cast<uint16_t*>(query_states.data);
-  auto yCasted = static_cast<uint16_t*>(key_states.data);
-  auto mCasted = static_cast<uint16_t*>(attention_mask.data);
-  auto y2Casted = static_cast<uint16_t*>(value_states.data);
+  uint16_t* b_bo_map = rope_inbos[1].map<uint16_t*>();
+  auto trig_max_len_offset = 2 * max_seq_length * cs_1;
+  auto b_bo_map_offset = S * H;
 
-  std::vector<size_t> bmm1_shape{(size_t)B * N, (size_t)S_q, (size_t)H};
-  std::vector<size_t> bmm1_trans_weight_shape{(size_t)B * N, (size_t)H,
-                                              (size_t)S_k};
-  std::vector<size_t> softmax_shape{(size_t)N, (size_t)S_q, (size_t)S_k};
-  std::vector<size_t> bmm2_shape{(size_t)B * N, (size_t)S_q, (size_t)S_k};
-  std::vector<size_t> bmm2_weight_shape{(size_t)B * N, (size_t)S_k, (size_t)H};
-  bmm1_->set_execute_kernel_shape(bmm1_shape, bmm1_trans_weight_shape);
-  bmm2_->set_execute_kernel_shape(bmm2_shape, bmm2_weight_shape);
+  size_t pos_offset = (S == 1) ? (past_S)*H : 0;
+  MY_LOG(2) << "===aie rope offset: " << past_S << std::endl;
+
+  MY_LOG(2) << "copy cos." << std::endl;
+  memcpy((void*)b_bo_map, (void*)(cos_sin_cache__.get() + pos_offset),
+         S * H * sizeof(uint16_t));
+  MY_LOG(2) << "copy sin." << std::endl;
+  memcpy((void*)(b_bo_map + b_bo_map_offset),
+         (void*)(cos_sin_cache__.get() + pos_offset + trig_max_len_offset),
+         S * H * sizeof(uint16_t));
+
+  uint16_t* rope_out = rope_outbos[0].map<uint16_t*>();
+  rope_inbos[0].sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  rope_inbos[1].sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  MY_LOG(2) << "aie execute." << std::endl;
+  TRY_EXECUTE_WITH_LOG(
+      rope_q_->execute(rope_inbos, rope_outbos), dry_run_,
+      ReportInventory::getInstance().addData, "mha_rope_" + std::to_string(S),
+      std::to_string(N) + "_" + std::to_string(S) + "_" + std::to_string(H));
+  rope_outbos[0].sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+  MY_LOG(2) << "copy output." << std::endl;
+  memcpy(output, rope_out, N * S * H * sizeof(uint16_t));
+  MY_LOG(2) << "aie rope done." << std::endl;
+}
+
+void MyCustomOpKernel::aie_execute_mha(uint16_t* output, const int N_q,
+                                       const int N_kv, const int S,
+                                       const int S_pad, const int H) {
+  MY_LOG(2) << "Running AIE MHA alone.";
+  /// set kernel shapes
+  std::vector<size_t> bmm1_shape_a{(size_t)N_q, (size_t)S_pad, (size_t)H};
+  std::vector<size_t> bmm1_shape_w{(size_t)N_kv, (size_t)H, (size_t)S_pad};
+  std::vector<size_t> softmax_shape{(size_t)N_q, (size_t)S_pad, (size_t)S_pad};
+  std::vector<size_t> bmm2_shape_a{(size_t)N_q, (size_t)S_pad, (size_t)S_pad};
+  std::vector<size_t> bmm2_shape_w{(size_t)N_kv, (size_t)S_pad, (size_t)H};
+  bmm1_->set_execute_kernel_shape(bmm1_shape_a, bmm1_shape_w);
+  bmm2_->set_execute_kernel_shape(bmm2_shape_a, bmm2_shape_w);
   softmax_->set_params("softmax", softmax_shape);
-
-  // Get XRT Buffers
-  uint16_t* a_bo_map = bmm1_inputs[0].map<uint16_t*>();
-  memcpy((void*)a_bo_map, (void*)xCasted, B * N * S_q * H * sizeof(uint16_t));
-
-  uint16_t* b_bo_map = bmm1_inputs[1].map<uint16_t*>();
-  memcpy((void*)b_bo_map, (void*)yCasted, B * N * S_k * H * sizeof(uint16_t));
 
   // Sync data
   bmm1_inputs[0].sync(XCL_BO_SYNC_BO_TO_DEVICE);
   bmm1_inputs[1].sync(XCL_BO_SYNC_BO_TO_DEVICE);
-  bmm1_outputs[0].sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  softmax_mask.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  bmm2_inputs[1].sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
-  // Execute QKT MatMul
 #ifdef _WIN32
+  // Execute QKT MatMul
   TRY_EXECUTE_WITH_LOG(bmm1_->execute(bmm1_inputs, bmm1_outputs, false),
                        dry_run_, ReportInventory::getInstance().addData,
-                       "bmm_" + std::to_string(S_q),
-                       std::to_string(B * N) + "_" + std::to_string(S_q) + "_" +
+                       "bmm_" + std::to_string(S_pad),
+                       std::to_string(N_q) + "_" + std::to_string(S_pad) + "_" +
                            std::to_string(H));
 #else
   TRY_EXECUTE_WITH_LOG(bmm1_->execute(bmm1_inputs, bmm1_outputs, true),
                        dry_run_, ReportInventory::getInstance().addData,
-                       "bmm_" + std::to_string(S_q),
-                       std::to_string(B * N) + "_" + std::to_string(S_q) + "_" +
+                       "bmm_" + std::to_string(S_pad),
+                       std::to_string(N_q) + "_" + std::to_string(S_pad) + "_" +
                            std::to_string(H));
 #endif
-
-  // Get SM buffers
-  uint16_t* mask_bo_map = softmax_mask.map<uint16_t*>();
-  memcpy((void*)mask_bo_map, (void*)mCasted, S_q * S_k * sizeof(uint16_t));
-
   // Sync
-  softmax_mask.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-  bmm2_inputs[0].sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
   std::vector<xrt::bo> inputs = {bmm1_outputs[0], softmax_mask};
   std::vector<xrt::bo> outputs = {bmm2_inputs[0]};
@@ -902,152 +881,206 @@ void MyCustomOpKernel::aie_execute(OrtTensor& query_states,
 #ifdef _WIN32
   TRY_EXECUTE_WITH_LOG(softmax_->execute(inputs, outputs, false), dry_run_,
                        ReportInventory::getInstance().addData,
-                       "masked_softmax_" + std::to_string(S_q),
-                       std::to_string(N) + "_" + std::to_string(S_q) + "_" +
-                           std::to_string(S_k));
+                       "masked_softmax_" + std::to_string(S_pad),
+                       std::to_string(N_q) + "_" + std::to_string(S_pad) + "_" +
+                           std::to_string(S_pad));
 #else
   TRY_EXECUTE_WITH_LOG(softmax_->execute(inputs, outputs, true), dry_run_,
                        ReportInventory::getInstance().addData,
-                       "masked_softmax_" + std::to_string(S_q),
-                       std::to_string(N) + "_" + std::to_string(S_q) + "_" +
-                           std::to_string(S_k));
+                       "masked_softmax_" + std::to_string(S_pad),
+                       std::to_string(N_q) + "_" + std::to_string(S_pad) + "_" +
+                           std::to_string(S_pad));
 #endif
 
-  // Get SMV MatMul buffers
-  uint16_t* value_bo_map = bmm2_inputs[1].map<uint16_t*>();
-  memcpy((void*)value_bo_map, (void*)y2Casted,
-         B * N * S_k * H * sizeof(uint16_t));
-
-  // Sync
-  bmm2_inputs[1].sync(XCL_BO_SYNC_BO_TO_DEVICE);
-  bmm2_outputs[0].sync(XCL_BO_SYNC_BO_TO_DEVICE);
-
   // Execute SMV MatMul
-  TRY_EXECUTE_WITH_LOG(bmm2_->execute(bmm2_inputs, bmm2_outputs), dry_run_,
-                       ReportInventory::getInstance().addData,
-                       "bmm_" + std::to_string(S_q),
-                       std::to_string(B * N) + "_" + std::to_string(S_q) + "_" +
-                           std::to_string(S_k));
+  TRY_EXECUTE_WITH_LOG(bmm2_->execute(bmm2_inputs, bmm2_outputs, true),
+                       dry_run_, ReportInventory::getInstance().addData,
+                       "bmm_" + std::to_string(S_pad),
+                       std::to_string(N_q) + "_" + std::to_string(S_pad) + "_" +
+                           std::to_string(S_pad));
   // Sync output
   bmm2_outputs[0].sync(XCL_BO_SYNC_BO_FROM_DEVICE);
 
   // Copy output from XRT BO to OrtTensor
-  uint16_t* out = bmm2_outputs[0].map<uint16_t*>();
-  uint64_t tensor_size = output.size;
-  MY_LOG(2) << "output size from aie: " << tensor_size;
-  memcpy(output.data, out, tensor_size * sizeof(uint16_t));
-  MY_LOG(2) << "output copy done.";
+  if (output != nullptr) {
+    uint16_t* output_bo = bmm2_outputs[0].map<uint16_t*>();
+    memcpy(output, output_bo, N_q * S * H * sizeof(uint16_t));
+  }
 }
 
-void MyCustomOpKernel::aie_execute(OrtTensor& query_states,
-                                   OrtTensor& key_states,
-                                   OrtTensor& value_states,
-                                   OrtTensor& attention_mask) {
-  // Code taken from:
-  // https://gitenterprise.xilinx.com/VitisAI/transformers/blob/main/ops/torch_cpp/src/mha_npu_torch.cpp#L41
+void MyCustomOpKernel::aie_execute_rope_mha(uint16_t* output, const int N_q,
+                                            const int N_kv, const int S,
+                                            const int S_pad, const int H) {
+  MY_LOG(2) << "Running AIE RoPE MHA with BO sharing.";
+  /// set kernel shapes
+  std::vector<size_t> rope_q_shape{(size_t)N_q, (size_t)S_pad, (size_t)H};
+  std::vector<size_t> rope_k_shape{(size_t)N_kv, (size_t)S_pad, (size_t)H};
+  std::vector<size_t> bmm1_shape_a{(size_t)N_q, (size_t)S_pad, (size_t)H};
+  std::vector<size_t> bmm1_shape_w{(size_t)N_kv, (size_t)H, (size_t)S_pad};
+  std::vector<size_t> softmax_shape{(size_t)N_q, (size_t)S_pad, (size_t)S_pad};
+  std::vector<size_t> bmm2_shape_a{(size_t)N_q, (size_t)S_pad, (size_t)S_pad};
+  std::vector<size_t> bmm2_shape_w{(size_t)N_kv, (size_t)S_pad, (size_t)H};
 
-  // Get Shapes
-  int B = query_states.shape[0];   // Batch
-  int N = query_states.shape[1];   // Number of heads
-  int S_q = query_states.shape[2]; // Sequence length of query
-  int H = query_states.shape[3];   // Head_size
-  int S_k = key_states.shape[2];   // Sequence length of key
-
-  // Get data pointers
-  auto xCasted = static_cast<uint16_t*>(query_states.data);
-  auto yCasted = static_cast<uint16_t*>(key_states.data);
-  auto mCasted = static_cast<uint16_t*>(attention_mask.data);
-  auto y2Casted = static_cast<uint16_t*>(value_states.data);
-
-  std::vector<size_t> bmm1_shape{(size_t)B * N, (size_t)S_q, (size_t)H};
-  std::vector<size_t> bmm1_trans_weight_shape{(size_t)B * N, (size_t)H,
-                                              (size_t)S_k};
-  std::vector<size_t> softmax_shape{(size_t)N, (size_t)S_q, (size_t)S_k};
-  std::vector<size_t> bmm2_shape{(size_t)B * N, (size_t)S_q, (size_t)S_k};
-  std::vector<size_t> bmm2_weight_shape{(size_t)B * N, (size_t)S_k, (size_t)H};
-  bmm1_->set_execute_kernel_shape(bmm1_shape, bmm1_trans_weight_shape);
-  bmm2_->set_execute_kernel_shape(bmm2_shape, bmm2_weight_shape);
+  rope_q_->set_params("rope", rope_q_shape);
+  rope_k_->set_params("rope", rope_k_shape);
+  bmm1_->set_execute_kernel_shape(bmm1_shape_a, bmm1_shape_w);
+  bmm2_->set_execute_kernel_shape(bmm2_shape_a, bmm2_shape_w);
   softmax_->set_params("softmax", softmax_shape);
 
-  // Get XRT Buffers
-  uint16_t* a_bo_map = bmm1_inputs[0].map<uint16_t*>();
-  memcpy((void*)a_bo_map, (void*)xCasted, B * N * S_q * H * sizeof(uint16_t));
+  uint16_t* rope_q_cs_bo = rope_q_inputs[1].map<uint16_t*>();
+  uint16_t* rope_k_cs_bo = rope_k_inputs[1].map<uint16_t*>();
+  auto trig_max_len_offset = 2 * max_seq_length * cs_1;
+  auto cs_bo_offset = S_pad * H;
 
-  uint16_t* b_bo_map = bmm1_inputs[1].map<uint16_t*>();
-  memcpy((void*)b_bo_map, (void*)yCasted, B * N * S_k * H * sizeof(uint16_t));
+  memcpy((void*)rope_q_cs_bo, (void*)(cos_sin_cache__.get()),
+         S_pad * H * sizeof(uint16_t));
+  memcpy((void*)(rope_q_cs_bo + cs_bo_offset),
+         (void*)(cos_sin_cache__.get() + trig_max_len_offset),
+         S_pad * H * sizeof(uint16_t));
 
-  // Sync data
-  bmm1_inputs[0].sync(XCL_BO_SYNC_BO_TO_DEVICE);
-  bmm1_inputs[1].sync(XCL_BO_SYNC_BO_TO_DEVICE);
-  bmm1_outputs[0].sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  memcpy((void*)rope_k_cs_bo, (void*)(cos_sin_cache__.get()),
+         S_pad * H * sizeof(uint16_t));
+  memcpy((void*)(rope_k_cs_bo + cs_bo_offset),
+         (void*)(cos_sin_cache__.get() + trig_max_len_offset),
+         S_pad * H * sizeof(uint16_t));
 
-// Execute QKT MatMul
-#ifdef _WIN32
-  TRY_EXECUTE_WITH_LOG(bmm1_->execute(bmm1_inputs, bmm1_outputs, false),
-                       dry_run_, ReportInventory::getInstance().addData,
-                       "bmm_" + std::to_string(S_q),
-                       std::to_string(B * N) + "_" + std::to_string(S_q) + "_" +
-                           std::to_string(H));
-#else
-  TRY_EXECUTE_WITH_LOG(bmm1_->execute(bmm1_inputs, bmm1_outputs, true),
-                       dry_run_, ReportInventory::getInstance().addData,
-                       "bmm_" + std::to_string(S_q),
-                       std::to_string(B * N) + "_" + std::to_string(S_q) + "_" +
-                           std::to_string(H));
-#endif
-
-  // Get SM buffers
-  uint16_t* mask_bo_map = softmax_mask.map<uint16_t*>();
-  memcpy((void*)mask_bo_map, (void*)mCasted, S_q * S_k * sizeof(uint16_t));
-
-  // Sync
+  rope_q_inputs[0].sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  rope_q_inputs[1].sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  rope_k_inputs[0].sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  rope_k_inputs[1].sync(XCL_BO_SYNC_BO_TO_DEVICE);
   softmax_mask.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-  bmm2_inputs[0].sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  bmm2_inputs[1].sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
-  std::vector<xrt::bo> inputs = {bmm1_outputs[0], softmax_mask};
-  std::vector<xrt::bo> outputs = {bmm2_inputs[0]};
-
-// Execute Softmax
 #ifdef _WIN32
-  TRY_EXECUTE_WITH_LOG(softmax_->execute(inputs, outputs, false), dry_run_,
-                       ReportInventory::getInstance().addData,
-                       "masked_softmax_" + std::to_string(S_q),
-                       std::to_string(N) + "_" + std::to_string(S_q) + "_" +
-                           std::to_string(S_k));
+  TRY_EXECUTE_WITH_LOG(rope_q_->execute(rope_q_inputs, rope_q_outputs, false),
+                       dry_run_, ReportInventory::getInstance().addData,
+                       "mha_rope_" + std::to_string(S_pad),
+                       std::to_string(N_q) + "_" + std::to_string(S_pad) + "_" +
+                           std::to_string(H));
+
+  TRY_EXECUTE_WITH_LOG(rope_k_->execute(rope_k_inputs, rope_k_outputs, false),
+                       dry_run_, ReportInventory::getInstance().addData,
+                       "mha_rope_" + std::to_string(S_pad),
+                       std::to_string(N_q) + "_" + std::to_string(S_pad) + "_" +
+                           std::to_string(H));
 #else
-  TRY_EXECUTE_WITH_LOG(softmax_->execute(inputs, outputs, true), dry_run_,
-                       ReportInventory::getInstance().addData,
-                       "masked_softmax_" + std::to_string(S_q),
-                       std::to_string(N) + "_" + std::to_string(S_q) + "_" +
-                           std::to_string(S_k));
+  TRY_EXECUTE_WITH_LOG(rope_q_->execute(rope_q_inputs, rope_q_outputs, true),
+                       dry_run_, ReportInventory::getInstance().addData,
+                       "mha_rope_" + std::to_string(S_pad),
+                       std::to_string(N_q) + "_" + std::to_string(S_pad) + "_" +
+                           std::to_string(H));
+
+  TRY_EXECUTE_WITH_LOG(rope_k_->execute(rope_k_inputs, rope_k_outputs, true),
+                       dry_run_, ReportInventory::getInstance().addData,
+                       "mha_rope_" + std::to_string(S_pad),
+                       std::to_string(N_q) + "_" + std::to_string(S_pad) + "_" +
+                           std::to_string(H));
 #endif
 
-  // Get SMV MatMul buffers
-  uint16_t* value_bo_map = bmm2_inputs[1].map<uint16_t*>();
-  memcpy((void*)value_bo_map, (void*)y2Casted,
-         B * N * S_k * H * sizeof(uint16_t));
-
-  // Sync
-  bmm2_inputs[1].sync(XCL_BO_SYNC_BO_TO_DEVICE);
-  bmm2_outputs[0].sync(XCL_BO_SYNC_BO_TO_DEVICE);
-
-// Execute SMV MatMul
+  std::vector<xrt::bo> bmm1_shared_inputs = {rope_q_outputs[0],
+                                             rope_k_outputs[0]};
 #ifdef _WIN32
-  TRY_EXECUTE_WITH_LOG(bmm2_->execute(bmm2_inputs, bmm2_outputs, false),
+  // Execute QKT MatMul
+  TRY_EXECUTE_WITH_LOG(bmm1_->execute(bmm1_shared_inputs, bmm1_outputs, false),
                        dry_run_, ReportInventory::getInstance().addData,
-                       "bmm_" + std::to_string(S_q),
-                       std::to_string(B * N) + "_" + std::to_string(S_q) + "_" +
-                           std::to_string(S_k));
+                       "bmm_" + std::to_string(S_pad),
+                       std::to_string(N_kv) + "_" + std::to_string(S_pad) +
+                           "_" + std::to_string(H));
 #else
+  TRY_EXECUTE_WITH_LOG(bmm1_->execute(bmm1_shared_inputs, bmm1_outputs, true),
+                       dry_run_, ReportInventory::getInstance().addData,
+                       "bmm_" + std::to_string(S_pad),
+                       std::to_string(N_kv) + "_" + std::to_string(S_pad) +
+                           "_" + std::to_string(H));
+#endif
+
+  std::vector<xrt::bo> sm_inputs = {bmm1_outputs[0], softmax_mask};
+  std::vector<xrt::bo> sm_outputs = {bmm2_inputs[0]};
+
+#ifdef _WIN32
+  // Execute Softmax
+  TRY_EXECUTE_WITH_LOG(softmax_->execute(sm_inputs, sm_outputs, false),
+                       dry_run_, ReportInventory::getInstance().addData,
+                       "masked_softmax_" + std::to_string(S_pad),
+                       std::to_string(N_q) + "_" + std::to_string(S_pad) + "_" +
+                           std::to_string(S_pad));
+
+#else
+  TRY_EXECUTE_WITH_LOG(softmax_->execute(sm_inputs, sm_outputs, true), dry_run_,
+                       ReportInventory::getInstance().addData,
+                       "masked_softmax_" + std::to_string(S_pad),
+                       std::to_string(N_q) + "_" + std::to_string(S_pad) + "_" +
+                           std::to_string(S_pad));
+#endif
+  // Execute SMV MatMul
   TRY_EXECUTE_WITH_LOG(bmm2_->execute(bmm2_inputs, bmm2_outputs, true),
                        dry_run_, ReportInventory::getInstance().addData,
-                       "bmm_" + std::to_string(S_q),
-                       std::to_string(B * N) + "_" + std::to_string(S_q) + "_" +
-                           std::to_string(S_k));
-#endif
+                       "bmm_" + std::to_string(S_pad),
+                       std::to_string(N_q) + "_" + std::to_string(S_pad) + "_" +
+                           std::to_string(S_pad));
+
   // Sync output
-  // bmm2_outputs[0].sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-  MY_LOG(2) << "aie execute for mha done......\n";
+  bmm2_outputs[0].sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+
+  // Copy output from XRT BO to OrtTensor
+  if (output != nullptr) {
+    uint16_t* output_bo = bmm2_outputs[0].map<uint16_t*>();
+    memcpy(output, output_bo, S * N_q * H * sizeof(uint16_t));
+  }
+  rope_q_outputs[0].sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+  rope_k_outputs[0].sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+}
+
+void MyCustomOpKernel::aie_execute_token(uint16_t* output, int N_q, int N_kv,
+                                         int S, int T, int H) {
+
+  std::vector<size_t> bmm1_shape_a{(size_t)N_q, (size_t)S, (size_t)H};
+  std::vector<size_t> bmm1_shape_w{(size_t)N_kv, (size_t)H, (size_t)T};
+  std::vector<size_t> softmax_shape{(size_t)N_q, (size_t)128, (size_t)T};
+  std::vector<size_t> bmm2_shape_a{(size_t)N_q, (size_t)S, (size_t)T};
+  std::vector<size_t> bmm2_shape_w{(size_t)N_kv, (size_t)T, (size_t)H};
+
+  MY_LOG(2) << "AIE excute token params: \n"
+            << "  N_q: " << N_q << " N_kv: " << N_kv << "  S: " << S
+            << " H: " << H << " T: " << T;
+
+  // Set kernel shape
+  bmm1_->set_execute_kernel_shape(bmm1_shape_a, bmm1_shape_w);
+  bmm2_->set_execute_kernel_shape(bmm2_shape_a, bmm2_shape_w);
+  softmax_->set_params("softmax", softmax_shape);
+
+  // Execute QKT MatMul
+  MY_LOG(2) << "BMM1 execute.";
+  __TIC__(AIET_BMM_QKT)
+  bmm1_->execute(bmm1_inputs, bmm1_outputs, false);
+  __TOC__(AIET_BMM_QKT)
+
+  // Set softmax inputs/outputs
+  std::vector<xrt::bo> sm_inputs = {bmm1_outputs[0], softmax_mask};
+  std::vector<xrt::bo> sm_outputs = {bmm2_inputs[0]};
+
+  // Execute Softmax
+  MY_LOG(2) << "AIE softmax execute.";
+  __TIC__(AIET_Softmax)
+  softmax_->execute(sm_inputs, sm_outputs, false);
+  __TOC__(AIET_Softmax)
+
+  // Execute SMV MatMul
+  MY_LOG(2) << "BMM2 execute.";
+  __TIC__(AIET_BMM_SfmV)
+  bmm2_->execute(bmm2_inputs, bmm2_outputs, true);
+  __TOC__(AIET_BMM_SfmV)
+
+  // Sync output
+  __TIC__(AIET_SYNC_OUT)
+  bmm2_outputs[0].sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+  __TOC__(AIET_SYNC_OUT)
+
+  // Copy output from XRT BO to OrtTensor
+  if (output != nullptr) {
+    uint16_t* out_bo_map = bmm2_outputs[0].map<uint16_t*>();
+    memcpy(output, out_bo_map, N_q * 1 * H * sizeof(uint16_t));
+  }
 }
 
 static void GetInputTensorData(DataPtrWrapper& data_ptr, int data_type,
@@ -1084,102 +1117,22 @@ bool isBf16Model(const DataPtrWrapper& packed_qkv, DataPtrWrapper& present_key,
          present_value.is_bf16();
 }
 
-struct KVCacheData {
-  /// past/present k
-  const uint16_t* past_k_bf16 = {};
-  const float* present_k_fp32 = {};
-  uint16_t* present_k_bf16 = {};
-  /// past/present v
-  const uint16_t* past_v_bf16 = {};
-  const float* present_v_fp32 = {};
-  uint16_t* present_v_bf16 = {};
-  /// length
-  int past_SxH = 0;
-  int present_SxH = 0;
-  int head_size = 0;
-};
-
-void KV_cache_copy(void* raw_data, size_t n) {
-  auto data = reinterpret_cast<KVCacheData*>(raw_data);
-  auto past_offset = n * data->past_SxH;
-  auto present_offset = n * data->present_SxH;
-  auto copy_size = data->past_SxH;
-  auto new_token_offset = data->past_SxH;
-  std::memcpy(data->present_k_bf16 + present_offset,
-              data->past_k_bf16 + past_offset, copy_size * sizeof(uint16_t));
-  vec_float32_to_bf16(data->present_k_bf16 + present_offset + new_token_offset,
-                      data->present_k_fp32 + present_offset + new_token_offset,
-                      data->head_size);
-  std::memcpy(data->present_v_bf16 + present_offset,
-              data->past_v_bf16 + past_offset, copy_size * sizeof(uint16_t));
-  vec_float32_to_bf16(data->present_v_bf16 + present_offset + new_token_offset,
-                      data->present_v_fp32 + present_offset + new_token_offset,
-                      data->head_size);
-}
-
 /// @brief save present_k/v[B, N, S, H] to shared buffer[B, N, S_buffer, H].
 void save_present_kv_to_shared_buffer(uint16_t* dst_k, uint16_t* dst_v,
                                       const uint16_t* src_k,
                                       const uint16_t* src_v,
-                                      const int num_heads, const int num_group,
+                                      const int num_heads,
                                       const int buffer_seq_len,
                                       const int seq_len, const int head_size) {
   for (int n = 0; n < num_heads; n++) {
     int offset_dst = n * buffer_seq_len * head_size;
-    int offset_src_k = num_group * n * seq_len * head_size;
-    int offset_src_v = n * seq_len * head_size;
+    int offset_src = n * seq_len * head_size;
     int copy_size = seq_len * head_size;
-    std::memcpy(dst_k + offset_dst, src_k + offset_src_k,
+    std::memcpy(dst_k + offset_dst, src_k + offset_src,
                 copy_size * sizeof(uint16_t));
-    std::memcpy(dst_v + offset_dst, src_v + offset_src_v,
+    std::memcpy(dst_v + offset_dst, src_v + offset_src,
                 copy_size * sizeof(uint16_t));
   }
-}
-
-/// get the best num_batch for ctx.ParallelFor
-/// based on the TPS on Birman+
-int get_best_parallel_batch(int S) {
-  assert(S >= 0 && S <= MAX_SEQ_LENGTH);
-  int64_t best_batch = 1;
-  if ((S - 128) <= 0)
-    best_batch = 1;
-  else if ((S - 256) <= 0)
-    best_batch = 2;
-  else if ((S - 512) <= 0)
-    best_batch = 4;
-  else if ((S - 1024) <= 0)
-    best_batch = 8;
-  else if ((S - 2048) <= 0)
-    best_batch = 16;
-  else
-    best_batch = 24;
-  return best_batch;
-}
-
-std::string getCurrentTimeFileName(const std::string& prefix) {
-  std::time_t now = std::time(nullptr);
-  struct tm timeInfo;
-  char buf[20];
-#if defined(_WIN32)
-  localtime_s(&timeInfo, &now);
-
-#else
-  localtime_r(&now, &timeInfo);
-
-#endif
-  std::strftime(buf, sizeof(buf), "%Y%m%d%H%M%S", &timeInfo);
-  return prefix + std::string(buf) + ".bin";
-}
-
-void saveToFile(const std::string& fileName, const float* data,
-                std::size_t size) {
-  std::ofstream outFile(fileName, std::ios::binary);
-  if (!outFile) {
-    std::cerr << "Error opening file for writing: " << fileName << std::endl;
-    return;
-  }
-  outFile.write(reinterpret_cast<const char*>(data), size * sizeof(float));
-  outFile.close();
 }
 
 void GetQKVFromPackedQKV(uint16_t* q, uint16_t* k, uint16_t* v,
@@ -1251,7 +1204,7 @@ void MyCustomOpKernel::Compute(OrtKernelContext* context) {
   auto total_seqlen = ctx.GetInput(4);
   auto cos_cache = ctx.GetInput(5);
   auto sin_cache = ctx.GetInput(6);
-  const uint16_t* mm_inp = nullptr;
+  uint16_t* mm_inp = nullptr;
   uint16_t* output_ptr1 = nullptr;
   uint16_t* output_ptr = nullptr;
 
@@ -1435,6 +1388,8 @@ void MyCustomOpKernel::Compute(OrtKernelContext* context) {
   int N_kv = kv_num_heads_;   // kv num_heads
   int group_num = N_q / N_kv; // group num
   int H = head_size;          // head size
+  int past_S = seq_len_k[0];
+  int T = total_seq_len;
 
   size_t k_size = B * N_kv * S * H;
 
@@ -1449,73 +1404,67 @@ void MyCustomOpKernel::Compute(OrtKernelContext* context) {
       S <= mha_aie_kernel_info_.max_seq_length()) {
     MY_LOG(2) << "running AIE kernel" << std::endl;
     if (isBf16Model(qkv_data, present_k_data, present_v_data)) {
-      MY_LOG(2) << "transpose input." << std::endl;
-      uint16_t* bf16_q_data_transposed = nullptr;
-      uint16_t* bf16_k_data_transposed = nullptr;
+      int64_t S_pad = mha_aie_kernel_info_.try_pad_seq(S);
 
-      std::vector<int64_t> q_shape_transposed(
-          {static_cast<int64_t>(B), static_cast<int64_t>(N_q),
-           static_cast<int64_t>(S), static_cast<int64_t>(H)});
+      uint16_t* mask_bo_map = softmax_mask.map<uint16_t*>();
+      uint16_t* q_bo_map = bmm1_inputs[0].map<uint16_t*>();
+      uint16_t* k_bo_map = bmm1_inputs[1].map<uint16_t*>();
+      uint16_t* v_bo_map = bmm2_inputs[1].map<uint16_t*>();
 
-      MY_LOG(2) << "rope for q and k." << std::endl;
-      /// RoPE for q/k
-      float* fp32_q_data = nullptr;
-      float* fp32_q_rope = nullptr;
-      uint16_t* bf16_q_rope = GQO_Allocator.get_buffer_generic<uint16_t>(
-          q_size * sizeof(uint16_t), GQO_Allocator::BufferType::AIE_Q_ROPE);
-      uint16_t* bf16_k_data_transposed_padded =
-          GQO_Allocator.get_buffer_generic<uint16_t>(
-              q_size * sizeof(uint16_t), GQO_Allocator::BufferType::AIE_K_T_P);
+      uint16_t* bf16_K_BNSH = nullptr;
+      /// transpose V from [B, S, N_kv, H] to [B, N_kv, S, H]
+      MY_LOG(2) << "Transposing V." << std::endl;
+      uint16_t* bf16_V_BNSH = GQO_Allocator.get_buffer_generic<uint16_t>(
+          kv_size * sizeof(uint16_t), GQO_Allocator::BufferType::AIE_V_T);
+      __TIC__(TransposeV)
+      transpose0213(bf16_V_BNSH, v_data_ptr, B, S, N_kv, H, context);
+      __TOC__(TransposeV)
 
-      float* fp32_k_data = nullptr;
-      float* fp32_k_rope = nullptr;
-      uint16_t* bf16_k_rope_or_pad = nullptr;
-      if (mha_aie_kernel_info_.is_seq_aie_supported(S) &&
-          ENV_PARAM(USE_AIE_RoPE) == 1) {
-        MY_LOG(2) << "Using AIE RoPE for Query." << std::endl;
-        __TIC__(AIERoPEQuery)
-        rope_aie_execute(q_data_ptr, bf16_q_rope, N_q, S, H);
-        __TOC__(AIERoPEQuery)
+      /// Getting attention mask from LUT
+      MY_LOG(2) << "Filling attn mask." << std::endl;
+      __TIC__(AllocFillAttnMask)
+      size_t attention_mask_size = B * 1 * S * S;
+      assert(atten_mask_provider_ != nullptr);
+      uint16_t* bf16_attention_mask = atten_mask_provider_->get_atten_mask(S);
+      __TOC__(AllocFillAttnMask)
 
-        /// NOTE(haozhu):
-        /// AIE RoPE kernel only support N = 32 now, so we need to pad k before
-        /// rope k[B, N_kv, S, H] -> k_pad[B, N_q, S, H] -> k_pad_rope[B, N_q,
-        /// S, H]
-        MY_LOG(2) << "Using AIE RoPE for Key." << std::endl;
-        if (group_num == 1) {
-          __TIC__(AIERoPEKey)
-          rope_aie_execute(k_data_ptr, bf16_k_data_transposed_padded, N_q, S,
-                           H);
-          __TOC__(AIERoPEKey)
-        } else {
-          /// pad k when group_num != 1
-          __TIC__(PadKeyToQSize)
-          bf16_k_rope_or_pad = GQO_Allocator.get_buffer_generic<uint16_t>(
-              q_size * sizeof(uint16_t),
-              GQO_Allocator::BufferType::AIE_ROPE_OR_PAD);
-          pad_group_kv_BSNH(bf16_k_rope_or_pad, k_data_ptr, N_q, N_kv, S, H);
-          __TOC__(PadKeyToQSize)
-          __TIC__(AIERoPEKey)
-          rope_aie_execute(bf16_k_rope_or_pad, bf16_k_data_transposed_padded,
-                           N_q, S, H);
-          __TOC__(AIERoPEKey)
-        }
+      /// Try pad qkv and mask in S dimension to {256, 512, 1024, 2048}
+      try_pad_qkv(v_bo_map, bf16_V_BNSH, N_kv, S, S_pad, H);
+      try_pad_mask(mask_bo_map, bf16_attention_mask, S, S_pad);
+
+      if (ENV_PARAM(USE_AIE_RoPE) == 1 &&
+          mha_aie_kernel_info_.is_seq_aie_supported(S)) {
+        uint16_t* rope_q_in_bo = rope_q_inputs[0].map<uint16_t*>();
+        uint16_t* rope_k_in_bo = rope_k_inputs[0].map<uint16_t*>();
+        try_pad_qkv(rope_q_in_bo, q_data_ptr, N_q, S, S_pad, H);
+        try_pad_qkv(rope_k_in_bo, k_data_ptr, N_kv, S, S_pad, H);
+
+        const_cast<MyCustomOpKernel*>(this)->aie_execute_rope_mha(
+            nullptr, N_q, N_kv, S, S_pad, H);
+        bf16_K_BNSH = rope_k_outputs[0].map<uint16_t*>();
+        ;
       } else {
         MY_LOG(2) << "Using ORT RoPE for Query." << std::endl;
+        uint16_t* bf16_q_rope = GQO_Allocator.get_buffer_generic<uint16_t>(
+            q_size * sizeof(uint16_t), GQO_Allocator::BufferType::AIE_Q_ROPE);
+        uint16_t* bf16_k_rope = GQO_Allocator.get_buffer_generic<uint16_t>(
+            kv_size * sizeof(uint16_t), GQO_Allocator::BufferType::AIE_K_ROPE);
         __TIC__(TransposeQK)
-        bf16_q_data_transposed = GQO_Allocator.get_buffer_generic<uint16_t>(
-            q_size * sizeof(uint16_t), GQO_Allocator::BufferType::AIE_Q_T);
-        bf16_k_data_transposed = GQO_Allocator.get_buffer_generic<uint16_t>(
-            kv_size * sizeof(uint16_t), GQO_Allocator::BufferType::AIE_K_T);
+        uint16_t* bf16_q_data_transposed =
+            GQO_Allocator.get_buffer_generic<uint16_t>(
+                q_size * sizeof(uint16_t), GQO_Allocator::BufferType::AIE_Q_T);
+        uint16_t* bf16_k_data_transposed =
+            GQO_Allocator.get_buffer_generic<uint16_t>(
+                kv_size * sizeof(uint16_t), GQO_Allocator::BufferType::AIE_K_T);
         transpose0213(bf16_q_data_transposed, q_data_ptr, B, S, N_q, H,
                       context);
         transpose0213(bf16_k_data_transposed, k_data_ptr, B, S, N_kv, H,
                       context);
         __TOC__(TransposeQK)
         __TIC__(QueryBF16toFP32)
-        fp32_q_data = GQO_Allocator.get_buffer_generic<float>(
+        float* fp32_q_data = GQO_Allocator.get_buffer_generic<float>(
             q_size * sizeof(float), GQO_Allocator::BufferType::AIE_F_Q);
-        fp32_q_rope = GQO_Allocator.get_buffer_generic<float>(
+        float* fp32_q_rope = GQO_Allocator.get_buffer_generic<float>(
             q_size * sizeof(float), GQO_Allocator::BufferType::AIE_F_Q_ROPE);
         vec_bf16_to_float(fp32_q_data, bf16_q_data_transposed, q_size);
         __TOC__(QueryBF16toFP32)
@@ -1527,191 +1476,225 @@ void MyCustomOpKernel::Compute(OrtKernelContext* context) {
         vec_float32_to_bf16(bf16_q_rope, fp32_q_rope, q_size);
         __TOC__(QueryFP32toBF16)
 
-        MY_LOG(2) << "Using ORT RoPE for Key." << std::endl;
-        /// k[B, N_kv, S, H] -> rope_k[B, N_q, S, H] -> rope_pad_k[B, N_q, S, H]
         __TIC__(KeyBF16toFP32)
-        fp32_k_data = GQO_Allocator.get_buffer_generic<float>(
-            k_size * sizeof(float), GQO_Allocator::BufferType::AIE_F_K);
-        fp32_k_rope = GQO_Allocator.get_buffer_generic<float>(
-            k_size * sizeof(float), GQO_Allocator::BufferType::AIE_F_K_ROPE);
-        bf16_k_rope_or_pad = GQO_Allocator.get_buffer_generic<uint16_t>(
-            k_size * sizeof(uint16_t),
-            GQO_Allocator::BufferType::AIE_ROPE_OR_PAD);
-        vec_bf16_to_float(fp32_k_data, bf16_k_data_transposed, k_size);
+        float* fp32_k_data = GQO_Allocator.get_buffer_generic<float>(
+            kv_size * sizeof(float), GQO_Allocator::BufferType::AIE_F_K);
+        float* fp32_k_rope = GQO_Allocator.get_buffer_generic<float>(
+            kv_size * sizeof(float), GQO_Allocator::BufferType::AIE_F_K_ROPE);
+        vec_bf16_to_float(fp32_k_data, bf16_k_data_transposed, kv_size);
         __TOC__(KeyBF16toFP32)
         __TIC__(RoPEKey)
         RoPE(fp32_k_rope, fp32_k_data, pos_ids.data(), cos_cache, sin_cache, B,
              N_kv, S, H, context);
         __TOC__(RoPEKey)
         __TIC__(KeyFP32toBF16)
-        vec_float32_to_bf16(bf16_k_rope_or_pad, fp32_k_rope, k_size);
+        vec_float32_to_bf16(bf16_k_rope, fp32_k_rope, kv_size);
         __TOC__(KeyFP32toBF16)
-        pad_group_kv(bf16_k_data_transposed_padded, bf16_k_rope_or_pad, N_q,
-                     N_kv, S, H);
+        bf16_K_BNSH = bf16_k_rope;
+        try_pad_qkv(q_bo_map, bf16_q_rope, N_q, S, S_pad, H);
+        try_pad_qkv(k_bo_map, bf16_k_rope, N_kv, S, S_pad, H);
+        const_cast<MyCustomOpKernel*>(this)->aie_execute_mha(nullptr, N_q, N_kv,
+                                                             S, S_pad, H);
       }
 
-      MY_LOG(2) << "pad v to q size." << std::endl;
-      /// pad v from [B, N_kv, S, H] to [B, N_q, S, H]
-      // auto bf16_v_data_transposed = bf16_k_data_transposed + N_kv * S * H;
-      __TIC__(TransposeV)
-      uint16_t* bf16_v_data_transposed =
-          GQO_Allocator.get_buffer_generic<uint16_t>(
-              kv_size * sizeof(uint16_t), GQO_Allocator::BufferType::AIE_V_T);
-      transpose0213(bf16_v_data_transposed, v_data_ptr, B, S, N_kv, H, context);
-      __TOC__(TransposeV)
-      uint16_t* bf16_v_data_transposed_padded = nullptr;
-      /// pad v when group_num != 1
-      if (group_num == 1) {
-        bf16_v_data_transposed_padded = bf16_v_data_transposed;
-      } else {
-        __TIC__(AllocPadKVtoQ)
-        bf16_v_data_transposed_padded =
-            GQO_Allocator.get_buffer_generic<uint16_t>(
-                q_size * sizeof(uint16_t),
-                GQO_Allocator::BufferType::AIE_V_T_P);
-        pad_group_kv(bf16_v_data_transposed_padded, bf16_v_data_transposed, N_q,
-                     N_kv, S, H);
-        __TOC__(AllocPadKVtoQ)
-      }
       MY_LOG(2) << "save present k/v." << std::endl;
       /// save present k/v
       __TIC__(SavePresentKV)
-      /// past_present_share_buffer
       if (past_present_share_buffer) {
-        save_present_kv_to_shared_buffer(
-            present_k_data.cast<uint16_t>(), present_v_data.cast<uint16_t>(),
-            bf16_k_data_transposed_padded, bf16_v_data_transposed, N_kv,
-            group_num, past_k_shape[2], seq_len, head_size);
+        save_present_kv_to_shared_buffer(present_k_data.cast<uint16_t>(),
+                                         present_v_data.cast<uint16_t>(),
+                                         bf16_K_BNSH, bf16_V_BNSH, N_kv,
+                                         past_k_shape[2], seq_len, head_size);
       } else {
-        for (int n = 0; n < N_kv; n++) {
-          int offset_dst = n * S * H;
-          int offset_src = group_num * n * S * H;
-          std::memcpy(present_k_data.cast<uint16_t>() + offset_dst,
-                      bf16_k_data_transposed_padded + offset_src,
-                      S * H * sizeof(uint16_t));
-        }
-        std::memcpy(present_v_data.cast<uint16_t>(), bf16_v_data_transposed,
-                    k_size * sizeof(uint16_t));
+        std::memcpy(present_k_data.cast<uint16_t>(), bf16_K_BNSH,
+                    kv_size * sizeof(uint16_t));
+        std::memcpy(present_v_data.cast<uint16_t>(), bf16_V_BNSH,
+                    kv_size * sizeof(uint16_t));
       }
       __TOC__(SavePresentKV)
-      /// Q K V tensor for aie kernel
-      OrtTensor qTensor = {q_shape_transposed, q_size, (void*)bf16_q_rope};
-      OrtTensor kTensor = {q_shape_transposed, q_size,
-                           (void*)bf16_k_data_transposed_padded};
-      OrtTensor vTensor = {q_shape_transposed, q_size,
-                           (void*)bf16_v_data_transposed_padded};
-
-      MY_LOG(2) << "fill attn mask." << std::endl;
-      __TIC__(AllocFillAttnMask)
-      size_t attention_mask_size = B * 1 * S * S;
-      assert(atten_mask_provider_ != nullptr);
-      uint16_t* bf16_attention_mask = atten_mask_provider_->get_atten_mask(S);
-      __TOC__(AllocFillAttnMask)
-      OrtTensor attention_mask = {
-          {B, 1, S, S}, attention_mask_size, (void*)bf16_attention_mask};
-      __TIC__(bf16KernelOutputAlloc)
-      uint16_t* bf16_kernel_output_data = nullptr;
-      if (mladf_version_ == "v0") {
-        // bf16_kernel_output_data = GQO_Allocator.get_buffer_generic<uint16_t>(
-        //     output_size * sizeof(uint16_t),
-        //     GQO_Allocator::BufferType::AIE_KERNEL_OUT);
-        // output_ptr = bf16_kernel_output_data;
-      } else if (mladf_version_ == "v1") {
-        // output_ptr = output_data.cast<uint16_t>();
-      } else {
-        throw std::runtime_error("MLADF_VERSION mismatch, should be v0 or v1.");
-      }
-      // OrtTensor outTensor = {output_shape, output_size, (void*)output_ptr};
-      __TOC__(bf16KernelOutputAlloc)
-      uint16_t* q_padded_bf16 = nullptr;
-      uint16_t* k_padded_bf16 = nullptr;
-      uint16_t* v_padded_bf16 = nullptr;
-      uint16_t* rpb_padded_bf16 = nullptr;
-      uint16_t* output_padded_bf16 = nullptr;
-
-      // if S in {256, 512, 1024, 2048}, no need to pad,
-      // any other S in between need pad.
-      if (mha_aie_kernel_info_.is_seq_aie_supported(S)) {
-        MY_LOG(2) << "original shape, no need to pad." << std::endl;
-        __TIC__(AIECompute)
-        const_cast<MyCustomOpKernel*>(this)->aie_execute(
-            qTensor, kTensor, vTensor, attention_mask);
-        __TOC__(AIECompute)
-      } else {
-        __TIC__(AllocAndPadTensor)
-        int64_t S_padded = mha_aie_kernel_info_.try_pad_seq(S);
-        MY_LOG(2) << "padding " << S << " -> " << S_padded << std::endl;
-        /// q, k, v and output shapes are all the same {B, N, S_padded, H}
-        std::vector<int64_t> io_padded_shape{B, N_q, S_padded, H};
-        std::vector<int64_t> rpb_padded_shape{B, 1, S_padded, S_padded};
-        size_t io_padded_size = B * N_q * S_padded * H;
-        size_t rpb_padded_size = B * S_padded * S_padded;
-        q_padded_bf16 = GQO_Allocator.get_buffer_generic<uint16_t>(
-            io_padded_size * sizeof(uint16_t),
-            GQO_Allocator::BufferType::AIE_Q_P);
-        k_padded_bf16 = GQO_Allocator.get_buffer_generic<uint16_t>(
-            io_padded_size * sizeof(uint16_t),
-            GQO_Allocator::BufferType::AIE_K_P);
-        v_padded_bf16 = GQO_Allocator.get_buffer_generic<uint16_t>(
-            io_padded_size * sizeof(uint16_t),
-            GQO_Allocator::BufferType::AIE_V_P);
-        rpb_padded_bf16 = GQO_Allocator.get_buffer_generic<uint16_t>(
-            rpb_padded_size * sizeof(uint16_t),
-            GQO_Allocator::BufferType::AIE_RPB_P);
-        output_padded_bf16 = GQO_Allocator.get_buffer_generic<uint16_t>(
-            io_padded_size * sizeof(uint16_t),
-            GQO_Allocator::BufferType::AIE_OUTPUT_P);
-        MY_LOG(2) << "padding qkv" << std::endl;
-        pad_qkv(bf16_q_rope, q_padded_bf16, S, S_padded, N_q, H);
-        MY_LOG(2) << "padding k" << std::endl;
-        pad_qkv(bf16_k_data_transposed_padded, k_padded_bf16, S, S_padded, N_q,
-                H);
-        MY_LOG(2) << "padding v" << std::endl;
-        pad_qkv(bf16_v_data_transposed_padded, v_padded_bf16, S, S_padded, N_q,
-                H);
-        MY_LOG(2) << "padding rpb" << std::endl;
-        pad_rpb(bf16_attention_mask, rpb_padded_bf16, S, S_padded);
-        OrtTensor q_padded_tensor = {io_padded_shape, io_padded_size,
-                                     (void*)q_padded_bf16};
-        OrtTensor k_padded_tensor = {io_padded_shape, io_padded_size,
-                                     (void*)k_padded_bf16};
-        OrtTensor v_padded_tensor = {io_padded_shape, io_padded_size,
-                                     (void*)v_padded_bf16};
-        OrtTensor rpb_padded_tensor = {rpb_padded_shape, rpb_padded_size,
-                                       (void*)rpb_padded_bf16};
-        OrtTensor output_padded_tensor = {io_padded_shape, io_padded_size,
-                                          (void*)output_padded_bf16};
-        __TOC__(AllocAndPadTensor)
-
-        __TIC__(AIEComputePad)
-        MY_LOG(2) << "aie execute pad" << std::endl;
-        const_cast<MyCustomOpKernel*>(this)->aie_execute(
-            q_padded_tensor, k_padded_tensor, v_padded_tensor,
-            rpb_padded_tensor, output_padded_tensor);
-        __TOC__(AIEComputePad)
-        MY_LOG(2) << "slice padded output" << std::endl;
-
-        output_ptr = (uint16_t*)malloc(N_q * S * H * sizeof(uint16_t));
-        slice_output(output_padded_bf16, output_ptr, S, S_padded, N_q, H,
-                     mladf_version_);
-        mm_inp = static_cast<const uint16_t*>(output_ptr);
-      }
-      __TIC__(TransposeOut)
-      if (mladf_version_ == "v0") {
-        // MY_LOG(2) << "transpose output." << std::endl;
-        // transpose0213(output_data.cast<uint16_t>(), output_ptr, B, N_q, S, H,
-        //               context);
-      }
-      __TOC__(TransposeOut)
-
-      __TIC__(memoryFree);
-      __TOC__(memoryFree);
-
     } else {
       throw std::runtime_error(
           "Not supported now, only support QKV with bfloat16 as inputs.");
     }
+    if (!(mha_aie_kernel_info_.is_seq_aie_supported(S))) {
+      output_ptr = (uint16_t*)malloc(N_q * S * H * sizeof(uint16_t));
+      uint16_t* output_bo = bmm2_outputs[0].map<uint16_t*>();
+      memcpy(output_ptr, output_bo, N_q * S * H * sizeof(uint16_t));
+      mm_inp = output_ptr;
+    }
 
+  } else if ((!is_prefill) && ENV_PARAM(USE_AIE_GQO) == 1 &&
+             ENV_PARAM(USE_AIE_TOKEN) &&
+             T < mha_aie_kernel_info_.max_seq_length()) {
+    /// AIE Token phase
+    MY_LOG(2) << "AIE Token phase begin." << std::endl;
+    __TIC__(AIETokenPhase)
+    /// RoPE for Q
+    MY_LOG(2) << "AIE Token phase RoPE for Q." << std::endl;
+    uint16_t* bf16_q_rope = GQO_Allocator.get_buffer_generic<uint16_t>(
+        q_size * sizeof(uint16_t), GQO_Allocator::BufferType::AIE_Q_ROPE);
+    uint16_t* bf16_k_rope = GQO_Allocator.get_buffer_generic<uint16_t>(
+        kv_size * sizeof(uint16_t), GQO_Allocator::BufferType::AIE_K_ROPE);
+
+    if (ENV_PARAM(USE_AIE_RoPE) == 1) {
+      MY_LOG(2) << "====Using AIE RoPE for Query and Key." << std::endl;
+      __TIC__(AIETRoPEQ)
+      aie_execute_rope(q_data_ptr, bf16_q_rope, N_q, S, H, past_S);
+      __TOC__(AIETRoPEQ)
+      __TIC__(AIETRoPEK)
+      aie_execute_rope(k_data_ptr, bf16_k_rope, N_kv, S, H, past_S);
+      __TOC__(AIETRoPEK)
+    } else {
+      MY_LOG(2) << "====Using ORT RoPE for Query and Key." << std::endl;
+      uint16_t* bf16_q_data_transposed =
+          GQO_Allocator.get_buffer_generic<uint16_t>(
+              q_size * sizeof(uint16_t), GQO_Allocator::BufferType::AIE_Q_T);
+      uint16_t* bf16_k_data_transposed =
+          GQO_Allocator.get_buffer_generic<uint16_t>(
+              kv_size * sizeof(uint16_t), GQO_Allocator::BufferType::AIE_K_T);
+      __TIC__(TransposeQK)
+      transpose0213(bf16_q_data_transposed, q_data_ptr, B, S, N_q, H, context);
+      transpose0213(bf16_k_data_transposed, k_data_ptr, B, S, N_kv, H, context);
+      __TOC__(TransposeQK)
+
+      float* fp32_q_data = GQO_Allocator.get_buffer_generic<float>(
+          q_size * sizeof(float), GQO_Allocator::BufferType::AIE_F_Q);
+      float* fp32_q_rope = GQO_Allocator.get_buffer_generic<float>(
+          q_size * sizeof(float), GQO_Allocator::BufferType::AIE_F_Q_ROPE);
+      __TIC__(QueryBF16toFP32)
+      vec_bf16_to_float(fp32_q_data, bf16_q_data_transposed, q_size);
+      __TOC__(QueryBF16toFP32)
+
+      /// ORT RoPE for Query
+      __TIC__(RoPEQuery)
+      RoPE(fp32_q_rope, fp32_q_data, pos_ids.data(), cos_cache, sin_cache, B,
+           N_q, S, H, context);
+      __TOC__(RoPEQuery)
+
+      __TIC__(QueryFP32toBF16)
+      vec_float32_to_bf16(bf16_q_rope, fp32_q_rope, q_size);
+      __TOC__(QueryFP32toBF16)
+
+      __TIC__(KeyBF16toFP32)
+      float* fp32_k_data = GQO_Allocator.get_buffer_generic<float>(
+          kv_size * sizeof(float), GQO_Allocator::BufferType::AIE_F_K);
+      float* fp32_k_rope = GQO_Allocator.get_buffer_generic<float>(
+          kv_size * sizeof(float), GQO_Allocator::BufferType::AIE_F_K_ROPE);
+      vec_bf16_to_float(fp32_k_data, bf16_k_data_transposed, kv_size);
+      __TOC__(KeyBF16toFP32)
+
+      /// ORT RoPE for Key
+      __TIC__(RoPEKey)
+      RoPE(fp32_k_rope, fp32_k_data, pos_ids.data(), cos_cache, sin_cache, B,
+           N_kv, S, H, context);
+      __TOC__(RoPEKey)
+
+      __TIC__(KeyFP32toBF16)
+      vec_float32_to_bf16(bf16_k_rope, fp32_k_rope, kv_size);
+      __TOC__(KeyFP32toBF16)
+    }
+
+    MY_LOG(2) << "AIE Token phase Pad and Concat K/V." << std::endl;
+    int64_t T_pad = mha_aie_kernel_info_.try_pad_total_seq(T);
+
+    uint16_t* total_k_map = bmm1_inputs[1].map<uint16_t*>();
+    auto func_pad_concat_k = [&]() {
+      /// Pad and concat k
+      /// 1. concat pask_k with current_k to total_k.
+      /// 2. pad total_k from [B, N_kv, T, H] to [B, N_kv, T_pad, H], where
+      /// T_pad is multiples of 128
+      __TIC__(AIET_PadConcatK)
+      pad_concat_kv(total_k_map, past_k_data.cast<uint16_t>(), bf16_k_rope,
+                    N_kv, T, T_pad, H, past_present_share_buffer);
+      bmm1_inputs[1].sync(XCL_BO_SYNC_BO_TO_DEVICE);
+      __TOC__(AIET_PadConcatK)
+    };
+
+    uint16_t* total_v_map = bmm2_inputs[1].map<uint16_t*>();
+    auto func_pad_concat_v = [&]() {
+      /// Pad and concat v
+      /// 1. concat pask_v with current_v to total_v.
+      /// 2. pad total_v from [B, N_kv, T, H] to [B, N_kv, T_pad, H], where
+      /// T_pad is multiples of 128
+      __TIC__(AIET_PadConcatV)
+      pad_concat_kv(total_v_map, past_v_data.cast<uint16_t>(), v_data_ptr, N_kv,
+                    T, T_pad, H, past_present_share_buffer);
+      bmm2_inputs[1].sync(XCL_BO_SYNC_BO_TO_DEVICE);
+      __TOC__(AIET_PadConcatV)
+    };
+    auto rst_pad_concat_k = std::async(std::launch::async, func_pad_concat_k);
+    auto rst_pad_concat_v = std::async(std::launch::async, func_pad_concat_v);
+
+    /// save present k/v
+    /// if past_present_share_buffer, only new k/v should be saved to the share
+    /// buffer
+    auto func_savekv = [&]() {
+      __TIC__(AIET_SaveCurrentKV)
+      if (past_present_share_buffer) {
+        for (int n = 0; n < N_kv; n++) {
+          int past_S = T - 1;
+          std::memcpy(present_k_data.cast<uint16_t>() + n * 4096 * H +
+                          past_S * H,
+                      bf16_k_rope + n * H, H * sizeof(uint16_t));
+          /// no need to transpose v here
+          /// since the transpose is [B, 1, N, H] to [B, N, 1, H]
+          std::memcpy(present_v_data.cast<uint16_t>() + n * 4096 * H +
+                          past_S * H,
+                      v_data_ptr + n * H, H * sizeof(uint16_t));
+        }
+      } else {
+        for (int n = 0; n < N_kv; n++) {
+          int offset_dst = n * T * H;
+          int offset_src = n * T_pad * H;
+          std::memcpy(present_k_data.cast<uint16_t>() + offset_dst,
+                      total_k_map + offset_src, T * H * sizeof(uint16_t));
+          std::memcpy(present_v_data.cast<uint16_t>() + offset_dst,
+                      total_v_map + offset_src, T * H * sizeof(uint16_t));
+        }
+      }
+      __TOC__(AIET_SaveCurrentKV)
+    };
+    /// AIE MHA
+    /// pad q to [B, N_q, 128, H]
+    __TIC__(AIET_PadQKV)
+    uint16_t* q_bo_map = bmm1_inputs[0].map<uint16_t*>();
+    try_pad_qkv(q_bo_map, bf16_q_rope, N_q, S, 128, H);
+    bmm1_inputs[0].sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    __TOC__(AIET_PadQKV)
+    /// fill attention mask [B, 1, 128, T_pad]
+    __TIC__(AIET_FillAttnMaskToken)
+    uint16_t* mask_bo_map = softmax_mask.map<uint16_t*>();
+    fill_attn_mask_token(mask_bo_map, T, T_pad);
+    softmax_mask.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    __TOC__(AIET_FillAttnMaskToken)
+    /// alloc output padded for bmm2
+    size_t output_padded_size = B * N_q * 128 * H;
+    uint16_t* bf16_output_padded = GQO_Allocator.get_buffer_generic<uint16_t>(
+        output_padded_size * sizeof(uint16_t),
+        GQO_Allocator::BufferType::AIE_OUTPUT_P);
+    MY_LOG(2) << "AIE Token phase MHA execute." << std::endl;
+
+    // make sure the K,V is ready before aie_execute_token
+    rst_pad_concat_k.wait();
+    rst_pad_concat_v.wait();
+    // then we could start teh task to save preset KV
+    MY_LOG(2) << "AIE Token phase save present K/V." << std::endl;
+    auto rst_savekv = std::async(std::launch::async, func_savekv);
+
+    __TIC__(AIET_AieExecToken)
+    aie_execute_token(nullptr, N_q, N_kv, 128, T_pad, H);
+    __TOC__(AIET_AieExecToken)
+    MY_LOG(2) << "AIE Token phase done." << std::endl;
+    __TOC__(AIETokenPhase)
+
+    // sync present_kv before exit
+    rst_savekv.wait();
+    if (!(mha_aie_kernel_info_.is_seq_aie_supported(S))) {
+      output_ptr = (uint16_t*)malloc(N_q * S * H * sizeof(uint16_t));
+      uint16_t* output_bo = bmm2_outputs[0].map<uint16_t*>();
+      memcpy(output_ptr, output_bo, N_q * S * H * sizeof(uint16_t));
+      mm_inp = output_ptr;
+    }
   } else {
     MY_LOG(2) << "running ORT kernel" << std::endl;
     if (isBf16Model(qkv_data, present_k_data, present_v_data)) {
@@ -1828,7 +1811,7 @@ void MyCustomOpKernel::Compute(OrtKernelContext* context) {
 #endif
 
       vec_float32_to_bf16(output_ptr1, float_output_data_conveter, output_size);
-      mm_inp = static_cast<const uint16_t*>(output_ptr1);
+      mm_inp = output_ptr1;
       /*
             if (ENV_PARAM(USE_AIE_GQO) == 1) {
               int past_seq_len = past_k_shape[2];

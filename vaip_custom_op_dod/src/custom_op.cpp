@@ -48,6 +48,7 @@
 #include "custom_op.hpp"
 #pragma once
 
+#include "../../vaip/src/qos_updater.hpp"
 #include "utils.hpp"
 #include <filesystem>
 #include <fstream>
@@ -166,7 +167,6 @@ MyCustomOp::MyCustomOp(std::shared_ptr<const PassContext> context,
 
     // "dod_txn_root" should be removed
     std::string dod_txn_root = "dynamic_dispatch_vaiep";
-    bool in_mem = context->cache_in_mem();
     auto xclbin_config_path = context->xclbin_path_to_cache_files(
         std::filesystem::path(all_provider_options["xclbin"]));
     auto xclbin_config_name = xclbin_config_path.filename();
@@ -174,10 +174,7 @@ MyCustomOp::MyCustomOp(std::shared_ptr<const PassContext> context,
       LOG(FATAL) << "- Error: Unable to find xclbin. Make sure to set xclbin "
                     "path in provider options.";
     }
-    bool found = false;
-    found = found ||
-            (in_mem && (context->has_cache_file(xclbin_config_name.string())));
-    found = found || ((!in_mem) && fs::exists(xclbin_config_path));
+    bool found = context->has_cache_file(xclbin_config_name.string());
 
     if (!found) {
       std::string err_msg = std::string{"The xclbin : "} +
@@ -192,13 +189,9 @@ MyCustomOp::MyCustomOp(std::shared_ptr<const PassContext> context,
     auto meta_json_path = dd_cache_dir / meta_json;
     auto meta_state_path = dd_cache_dir / meta_state;
     OpsFusion::Metadata meta;
-    if (in_mem) {
-      auto file = context->read_file_c8(meta_json).value();
-      std::string str(file.data(), file.size());
-      meta = OpsFusion::load_meta_json_str(str);
-    } else {
-      meta = OpsFusion::load_meta_json(meta_json_path.string());
-    }
+    auto file = context->read_file_c8(meta_json).value();
+    std::string str(file.data(), file.size());
+    meta = OpsFusion::load_meta_json_str(str);
     meta_json_ = meta_json_path.string();
 
     in_tensors_ = OpsFusion::MetaUtils::get_input_tensors(meta);
@@ -306,59 +299,34 @@ MyCustomOp::MyCustomOp(std::shared_ptr<const PassContext> context,
                       << "\" to int, disable context sharing.";
         }
       }
-      std::uint32_t qos_priority;
+      // The qos_map will be used by update_qos, regardless of whether
+      // share_context_ is enabled or not.
       std::map<std::string, std::uint32_t> qos_map;
-      qos_priority_ = -1;
+      std::uint32_t qos_priority;
       if (meta_def->generic_param().contains("qos_priority")) {
         qos_priority = static_cast<uint32_t>(
             std::stoul(meta_def->generic_param().at("qos_priority")));
-        qos_map["priority"] = qos_priority;
-        //    For shell bg models, we force it to use dpm0 by setting the fps ,
-        //    latency nad gops to a lower value. This is done to avoid deadlock
-        //    ********************Note - This change assumes only shell bg
-        //    models have priority values set.
-
-        qos_map["fps"] = 1;
-        qos_map["latency"] = 200;
-        qos_map["gops"] = 1;
-
-        qos_priority_ = qos_priority;
+        qos_map["perf_pref"] = 1;
         LOG_THIS(1) << "Setting custom QoS Priority to DPM0";
       }
-
-      std::string perf_prefer_key = "session.workload_type";
-      auto sess_cfgs = context->get_config_proto().session_configs();
-      if (sess_cfgs.find(perf_prefer_key) != sess_cfgs.end()) {
-        std::string perf_prefer_value = sess_cfgs.at(perf_prefer_key);
-        if (perf_prefer_value != "Efficient" &&
-            perf_prefer_value != "Default") {
-          throw std::runtime_error(
-              "Invalid value for session.workload_type in session option: " +
-              perf_prefer_value);
-        } else {
-          qos_map["perf_pref"] = (perf_prefer_value == "Efficient") ? 1 : 0;
-          perf_pref_run_cached_ = perf_prefer_value;
-        }
-
-      } else {
-        qos_map["perf_pref"] = 0;
-        perf_pref_run_cached_ = "Default";
-      }
-      perf_pref_session_cached_ = perf_pref_run_cached_;
       support_eff_mode_ = true;
       if (share_context_) {
         LOG_THIS(1) << "DOD using shared context";
         auto device_id = 0;
         auto context_id = 0;
         // share context already handled in-memory xclbin issue
-        // Note(xcl) support efficient model backward compatibility for XRT
-        // driver in share context
         shared_ctx_ = vaip::Context::create_shared_context(
             *context, device_id, context_id, xclbin_config_path.string(),
             qos_map);
         shared_ctx_->update_qos(qos_map);
         runner_ = std::make_shared<OpsFusion::FusionRuntime>(
             &(shared_ctx_->xrt_hw_context()));
+
+        // use XRTUpdateQosImpl object to update efficient mode directly through
+        // xrt::hw_context
+        auto qos_updater = std::make_shared<vaip_core::XRTUpdateQosImpl>(
+            &shared_ctx_->xrt_hw_context());
+        context->add_QosUpdater(qos_updater);
       } else {
         LOG_THIS(1) << "DOD NOT using shared context";
         std::unique_ptr<xrt::xclbin> xrt_xclbin_ptr;
@@ -375,22 +343,15 @@ MyCustomOp::MyCustomOp(std::shared_ptr<const PassContext> context,
         auto xrt_device_ptr = std::make_unique<xrt::device>(0);
         xrt_device_ptr->register_xclbin(*xrt_xclbin_ptr);
 
-        try {
-          hw_ctx_ptr_ = std::make_shared<xrt::hw_context>(
-              *xrt_device_ptr, xrt_xclbin_ptr->get_uuid(), qos_map);
-        } catch (std::exception& e) {
-          if (std::string(e.what()).find("perf_pref") != std::string::npos) {
-            qos_map.erase("perf_pref");
-            LOG(WARNING) << "XRT device doesn't support efficient mode, will "
-                            "ignore the QoS request.";
-            hw_ctx_ptr_ = std::make_shared<xrt::hw_context>(
-                *xrt_device_ptr, xrt_xclbin_ptr->get_uuid(), qos_map);
-            support_eff_mode_ = false;
-          } else {
-            throw;
-          }
-        }
+        hw_ctx_ptr_ = std::make_shared<xrt::hw_context>(
+            *xrt_device_ptr, xrt_xclbin_ptr->get_uuid(), qos_map);
         runner_ = std::make_shared<OpsFusion::FusionRuntime>(hw_ctx_ptr_.get());
+
+        // use XRTUpdateQosImpl object to update efficient mode directly through
+        // xrt::hw_context
+        auto qos_updater =
+            std::make_shared<vaip_core::XRTUpdateQosImpl>(hw_ctx_ptr_.get());
+        context->add_QosUpdater(qos_updater);
       }
 
       OpsFusion::FusionRuntime* ptr = (OpsFusion::FusionRuntime*)runner_.get();
@@ -403,12 +364,10 @@ MyCustomOp::MyCustomOp(std::shared_ptr<const PassContext> context,
       auto fusion_runtime_load_state =
           mutable_context->measure("fusion_runtime_load_state");
       load_function func = nullptr;
-      if (in_mem) {
-        func = [&context](const std::string& path) -> FILE* {
-          auto filename = std::filesystem::path(path).filename().string();
-          return context->open_file(filename);
-        };
-      }
+      func = [&context](const std::string& path) -> FILE* {
+        auto filename = std::filesystem::path(path).filename().string();
+        return context->open_file(filename);
+      };
       ptr->load_state(meta_state_path.string(), func);
       fusion_runtime_load_state = nullptr;
       auto fusion_runtime_init =
@@ -443,51 +402,6 @@ void MyCustomOp::Compute(const OrtApi* api, OrtKernelContext* context) const {
   std::lock_guard<std::mutex> guard(execute_mutex_);
   WRAP(ddtimer_.reset();)
   WRAP(auto compute_begin = GET_TIMESTAMP());
-  std::string perf_pref_value =
-      context_->get_run_option("run.workload_type", "not_set");
-
-  if (perf_pref_value != "Efficient" && perf_pref_value != "Default" &&
-      perf_pref_value != "not_set") {
-    throw std::runtime_error(
-        "Invalid value for session.workload_type in session option: " +
-        perf_pref_value);
-  }
-  if (share_context_) {
-    LOG_THIS(1) << "DOD Kernel using shared context";
-    if (perf_pref_value != "not_set" &&
-        perf_pref_value != perf_pref_run_cached_) {
-      // Note(xcl) if efficient model is supported in XRT driver,
-      // update_qos_for_run_opt will do nothing internally
-      shared_ctx_->update_qos_for_run_opt(perf_pref_value);
-      perf_pref_run_cached_ = perf_pref_value;
-    } else if (perf_pref_value == "not_set" &&
-               perf_pref_run_cached_ != perf_pref_session_cached_) {
-      // Note(xcl) if efficient model is supported in XRT driver,
-      // update_qos_for_run_opt will do nothing internally
-      shared_ctx_->update_qos_for_run_opt(perf_pref_session_cached_);
-      perf_pref_run_cached_ = perf_pref_session_cached_;
-    }
-  } else if (support_eff_mode_) {
-    std::map<std::string, std::uint32_t> qos_map;
-    if (perf_pref_value != "not_set" &&
-        perf_pref_value != perf_pref_run_cached_) {
-      if (qos_priority_ != -1) {
-        qos_map["priority"] = qos_priority_;
-      }
-      qos_map["perf_pref"] = perf_pref_value == "Efficient" ? 1 : 0;
-      perf_pref_run_cached_ = perf_pref_value;
-    } else if (perf_pref_value == "not_set" &&
-               perf_pref_run_cached_ != perf_pref_session_cached_) {
-      if (qos_priority_ != -1) {
-        qos_map["priority"] = qos_priority_;
-      }
-      qos_map["perf_pref"] = perf_pref_session_cached_ == "Efficient" ? 1 : 0;
-      perf_pref_run_cached_ = perf_pref_session_cached_;
-    }
-    // update qos;
-
-    hw_ctx_ptr_->update_qos(qos_map);
-  }
 
   if (Ort::Global<void>::api_ == nullptr) {
     Ort::Global<void>::api_ = api;

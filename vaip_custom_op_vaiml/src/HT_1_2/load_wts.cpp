@@ -141,48 +141,21 @@ void loadAdd128(std::vector<uint8_t>& dst, int8_t* src, int size) {
 int saveMemoryToCache(const char* mem, size_t mem_size,
                       const vaip_core::PassContext& context,
                       std::string filename) {
-  bool in_mem = context.cache_in_mem();
   auto filepath = context.get_log_dir() / (filename + ".bin");
-  if (in_mem) {
-    const_cast<vaip_core::PassContext&>(context).write_file(
-        filename + ".bin", gsl::span<const char>(mem, mem_size));
-  } else {
-    std::ofstream ofsFile(filepath, std::ios::binary);
-    if (!ofsFile) {
-      std::cerr << "Error opening file for writing." << std::endl;
-      return 1;
-    }
-    ofsFile.write(mem, mem_size);
-    ofsFile.close();
-  }
+  const_cast<vaip_core::PassContext&>(context).write_file(
+      filename + ".bin", gsl::span<const char>(mem, mem_size));
   std::cout << mem_size << " bytes of memory saved to cache " << filepath
             << std::endl;
+  return 0;
 }
 
 int htGenerateLstmInput(const LstmSettings& s,
                         const struct lstm_init_wts& lstm_in, uint8_t* result,
                         const vaip_core::PassContext& context) {
   auto filename = s.layer_name + ".bin";
-  auto cachFilepath = context.get_log_dir() / filename;
-  bool in_mem = context.cache_in_mem();
-  if (in_mem && context.has_cache_file(filename)) {
-    auto wts_v = context.read_file_c8(filename).value();
-    memcpy(result, wts_v.data(), wts_v.size());
-    return 0;
-  } else if (std::filesystem::exists(cachFilepath)) {
-    auto wts_size = std::filesystem::file_size(cachFilepath);
-    // std::cout << " Load weights from cache " << cachFilepath << " size=" <<
-    // wts_size << std::endl;
-    std::ifstream ifsCacheFile(cachFilepath, std::ios::binary);
-    if (!ifsCacheFile) {
-      std::cerr << "Error opening file for reading:" << cachFilepath
-                << std::endl;
-      return 1;
-    }
-    ifsCacheFile.read((char*)result, wts_size);
-    ifsCacheFile.close();
-    return 0;
-  }
+  auto wts_v = context.read_file_c8(filename).value();
+  memcpy(result, wts_v.data(), wts_v.size());
+  return 0;
 
   // printf("### count: %d\n", count);
   // printf("####: %s: wrote %d bytes of data\n", s.layer_name.c_str(), p -

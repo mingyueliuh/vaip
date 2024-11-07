@@ -80,18 +80,17 @@ TEST_F(PassContextTest, ReadFileTest) {
 
     // Assert that the content of the file matches the expected content
     ASSERT_EQ(std::string(readResult->data(), readResult->size()), fileContent);
-    passContext->cache_files_to_tar_file(CMAKE_CURRENT_BINARY_PATH /
-                                         "ReadFileTest.tar");
   }
+  passContext->cache_files_to_tar_file(CMAKE_CURRENT_BINARY_PATH /
+                                       "ReadFileTest.tar");
   { // read it back from another pass context object.
-    auto passContext2 = vaip_core::PassContext::create();
-    passContext2->tar_file_to_cache_files(CMAKE_CURRENT_BINARY_PATH /
-                                          "ReadFileTest.tar");
+    passContext->tar_file_to_cache_files(CMAKE_CURRENT_BINARY_PATH /
+                                         "ReadFileTest.tar");
     for (auto i = 0; i < 3; ++i) {
       std::string filename =
           std::string("test_file_") + std::to_string(i) + ".txt";
       // Read the file using the read_file function
-      auto readResult = passContext2->read_file_c8(filename);
+      auto readResult = passContext->read_file_c8(filename);
 
       // Assert that the file was read successfully
       ASSERT_TRUE(readResult.has_value());
@@ -102,19 +101,17 @@ TEST_F(PassContextTest, ReadFileTest) {
     }
   }
   { // read it back from a chunk of memory.
-    auto passContext3 = vaip_core::PassContext::create();
-
     std::ifstream tar_ball(CMAKE_CURRENT_BINARY_PATH / "ReadFileTest.tar",
                            std::ios::binary);
     // read the whole file into `content` from tar_ball.
     std::vector<char> content((std::istreambuf_iterator<char>(tar_ball)),
                               std::istreambuf_iterator<char>());
-    passContext3->tar_mem_to_cache_files(content.data(), content.size());
+    passContext->tar_mem_to_cache_files(content.data(), content.size());
     for (auto i = 0; i < 3; ++i) {
       std::string filename =
           std::string("test_file_") + std::to_string(i) + ".txt";
       // Read the file using the read_file function
-      auto readResult = passContext3->read_file_c8(filename);
+      auto readResult = passContext->read_file_c8(filename);
 
       // Assert that the file was read successfully
       ASSERT_TRUE(readResult.has_value());
@@ -129,7 +126,7 @@ TEST_F(PassContextTest, UntarCacheTest) {
   for (auto i = 0; i < 3; ++i) {
     // Test file name
     std::string filename =
-        std::string("test_file_") + std::to_string(i) + ".txt";
+        std::string("UntarCacheTest.test_file_") + std::to_string(i) + ".txt";
 
     // Create a test file with some content
     std::string fileContent = "This is a test file for " + std::to_string(i);
@@ -138,7 +135,6 @@ TEST_F(PassContextTest, UntarCacheTest) {
 
     ASSERT_TRUE(writeResult);
   }
-  passContext->cache_files_to_directory(CMAKE_CURRENT_BINARY_PATH);
 }
 
 TEST_F(PassContextTest, TestEmptyFiles) {
@@ -146,7 +142,7 @@ TEST_F(PassContextTest, TestEmptyFiles) {
   for (auto i = 0; i < 3; ++i) {
     // Test file name
     std::string filename =
-        std::string("test_file_") + std::to_string(i) + ".txt";
+        std::string("TestEmptyFiles.test_file_") + std::to_string(i) + ".txt";
 
     // Create a test file with some content
     std::string fileContent = "This is a test file for " + std::to_string(i);
@@ -162,12 +158,11 @@ TEST_F(PassContextTest, TestEmptyFiles) {
     buffer = passContext->cache_files_to_tar_mem();
   }
   {
-    auto passContext3 = vaip_core::PassContext::create();
-    passContext3->tar_mem_to_cache_files(&buffer[0], buffer.size());
+    passContext->tar_mem_to_cache_files(&buffer[0], buffer.size());
     for (auto i = 0; i < 3; ++i) {
       // Test file name
       std::string filename =
-          std::string("test_file_") + std::to_string(i) + ".txt";
+          std::string("TestEmptyFiles.test_file_") + std::to_string(i) + ".txt";
 
       // Create a test file with some content
       std::string fileContent = "This is a test file for " + std::to_string(i);
@@ -175,7 +170,7 @@ TEST_F(PassContextTest, TestEmptyFiles) {
         fileContent = "";
       }
       // Read the file using the read_file function
-      auto readResult = passContext3->read_file_c8(filename);
+      auto readResult = passContext->read_file_c8(filename);
 
       // Assert that the file was read successfully
       ASSERT_TRUE(readResult.has_value());
@@ -226,7 +221,6 @@ TEST_F(PassContextTest, OnDiskTarTest) {
                   long_bytes.size());
   deep_file.close();
 
-  ctx1->directory_to_cache_files(dir);
   auto tar_file_path = dir / "x.tar";
   std::ignore = ctx1->cache_files_to_tar_file(tar_file_path);
 
@@ -237,9 +231,6 @@ TEST_F(PassContextTest, OnDiskTarTest) {
   auto ctx3 = vaip_core::PassContext::create();
   ctx3->tar_mem_to_cache_files(bytes.data(), bytes.size());
 
-  ctx1->cache_files_to_directory(res1_dir);
-  ctx2->cache_files_to_directory(res2_dir);
-  ctx3->cache_files_to_directory(res3_dir);
   for (const auto& f :
        std::filesystem::recursive_directory_iterator(res1_dir)) {
     if (std::filesystem::is_regular_file(f.path())) {
@@ -279,22 +270,21 @@ TEST_F(PassContextTest, TestCompress) {
 
 TEST_F(PassContextTest, TestGzTar) {
   {
-    auto passContext1 = vaip_core::PassContext::create();
     for (auto i = 0; i < 3; ++i) {
       // Test file name
       std::string filename =
-          std::string("test_file_") + std::to_string(i) + ".txt";
+          std::string("TestGzTar.test_file_") + std::to_string(i) + ".txt";
 
       // Create a test file with some content
       std::string fileContent = "This is a test file for " + std::to_string(i);
       bool writeResult =
-          passContext1->write_file(filename, gsl::make_span(fileContent));
+          passContext->write_file(filename, gsl::make_span(fileContent));
 
       // Assert that the file was successfully written
       ASSERT_TRUE(writeResult);
 
       // Read the file using the read_file function
-      auto readResult = passContext1->read_file_c8(filename);
+      auto readResult = passContext->read_file_c8(filename);
 
       // Assert that the file was read successfully
       ASSERT_TRUE(readResult.has_value());
@@ -303,22 +293,21 @@ TEST_F(PassContextTest, TestGzTar) {
       ASSERT_EQ(std::string(readResult->data(), readResult->size()),
                 fileContent);
     }
-    auto tar_mem = passContext1->cache_files_to_tar_mem();
+    auto tar_mem = passContext->cache_files_to_tar_mem();
     auto gz_tar_mem = vaip_core::compress(tar_mem);
     vaip_core::dump_binary(CMAKE_CURRENT_BINARY_PATH / "TestGzTar.tar.gz",
                            gz_tar_mem);
   }
   { // read it back from another pass context object.
-    auto passContext2 = vaip_core::PassContext::create();
     auto gz_tar_mem = vaip_core::slurp_binary_c8(CMAKE_CURRENT_BINARY_PATH /
                                                  "TestGzTar.tar.gz");
     auto tar_mem = vaip_core::uncompress(gz_tar_mem);
-    passContext2->tar_mem_to_cache_files(tar_mem.data(), tar_mem.size());
+    passContext->tar_mem_to_cache_files(tar_mem.data(), tar_mem.size());
     for (auto i = 0; i < 3; ++i) {
       std::string filename =
-          std::string("test_file_") + std::to_string(i) + ".txt";
+          std::string("TestGzTar.test_file_") + std::to_string(i) + ".txt";
       // Read the file using the read_file TestGzTar
-      auto readResult = passContext2->read_file_c8(filename);
+      auto readResult = passContext->read_file_c8(filename);
 
       // Assert that the file was read successfully
       ASSERT_TRUE(readResult.has_value());
@@ -354,9 +343,8 @@ TEST_F(PassContextTest, TestLongFilenames) {
     tar_mem = passContext->cache_files_to_tar_mem();
   }
   {
-    auto passContext3 = vaip_core::PassContext::create();
-    passContext3->tar_file_to_cache_files(CMAKE_CURRENT_BINARY_PATH /
-                                          "TestLongFileName.tar");
+    passContext->tar_file_to_cache_files(CMAKE_CURRENT_BINARY_PATH /
+                                         "TestLongFileName.tar");
     for (auto i = 0; i < 3; ++i) {
       // Test file name
       std::string filename = std::to_string(i) + long_name + std::to_string(i);
@@ -366,7 +354,7 @@ TEST_F(PassContextTest, TestLongFilenames) {
         fileContent = "";
       }
       // Read the file using the read_file function
-      auto readResult = passContext3->read_file_c8(filename);
+      auto readResult = passContext->read_file_c8(filename);
 
       // Assert that the file was read successfully
       ASSERT_TRUE(readResult.has_value());
@@ -375,8 +363,7 @@ TEST_F(PassContextTest, TestLongFilenames) {
     }
   }
   {
-    auto passContext3 = vaip_core::PassContext::create();
-    passContext3->tar_mem_to_cache_files(tar_mem.data(), tar_mem.size());
+    passContext->tar_mem_to_cache_files(tar_mem.data(), tar_mem.size());
     for (auto i = 0; i < 3; ++i) {
       // Test file name
       std::string filename = std::to_string(i) + long_name + std::to_string(i);
@@ -386,7 +373,7 @@ TEST_F(PassContextTest, TestLongFilenames) {
         fileContent = "";
       }
       // Read the file using the read_file function
-      auto readResult = passContext3->read_file_c8(filename);
+      auto readResult = passContext->read_file_c8(filename);
 
       // Assert that the file was read successfully
       ASSERT_TRUE(readResult.has_value());

@@ -189,7 +189,6 @@ struct Level1DynamicDispatch {
     auto [node_subgraph_labels, subgraph_node_cluster, target_label,
           idx_node_map] = dd::partition_onnx_model(cloned_graph);
 
-    bool in_mem = local_context->cache_in_mem();
     // LOG(DEBUG) << "Subgraph Node Cluster ";
     for (auto x : subgraph_node_cluster) {
       std::ostringstream str;
@@ -304,15 +303,8 @@ struct Level1DynamicDispatch {
           dd::graph_prepare_metadata(subgraph, model_dir);
       auto json_str =
           dd::save_tensors_to_json(op_list, new_tensors, new_tensors_map);
-      if (in_mem) {
-        std::vector<char> vec(json_str.begin(), json_str.end());
-        local_context->write_file(meta_json_path.filename().string(), vec);
-      } else {
-        CHECK(std::ofstream(meta_json_path)
-                  .write(&json_str[0], json_str.size())
-                  .good())
-            << "failed to write json";
-      }
+      std::vector<char> vec(json_str.begin(), json_str.end());
+      local_context->write_file(meta_json_path.filename().string(), vec);
       // Fusion Runtime Compilation and Saving Metastate
       { // this bracket reduces peak memory
         OpsFusion::FusionRuntime fusion_rt;
@@ -336,12 +328,21 @@ struct Level1DynamicDispatch {
         fusion_rt.compile(meta, dod_txn_root, cfg, std::move(const_db));
         LOG(INFO) << "COMPILE DONE";
         save_function func = nullptr;
-        if (in_mem) {
-          func = [&local_context](const std::string& path, FILE* file) {
-            auto filename = std::filesystem::path(path).filename().string();
-            local_context->write_tmpfile(filename, file);
-          };
-        }
+        func = [&local_context](const std::string& path, FILE* file) {
+          auto filename = std::filesystem::path(path).filename().string();
+          auto writer = local_context->open_file_for_write(filename);
+          fseek64(file, 0, SEEK_END);
+          auto size = ftell64(file);
+          fseek64(file, 0, SEEK_SET);
+          size_t buffer_size = 4096;
+          auto buffer = std::vector<char>(buffer_size);
+          size_t read_count = 0;
+          while ((read_count =
+                      std::fread(buffer.data(), 1, buffer_size, file)) > 0) {
+            writer->fwrite(buffer.data(), read_count);
+          }
+          fclose(file);
+        };
         fusion_rt.save_state(meta_state_name.string(), func);
         LOG(INFO) << "SAVE_STATE DONE";
       }

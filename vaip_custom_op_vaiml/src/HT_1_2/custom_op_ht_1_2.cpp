@@ -194,13 +194,7 @@ MyCustomOpHT1_2::MyCustomOpHT1_2(std::shared_ptr<const PassContext> context,
   // retrieve wts file from the cache directory to populate wts_
   std::vector<char> wts_file;
   auto wts_file_opt = context->read_file_c8(constants_file_name_);
-  if (wts_file_opt.has_value()) {
-    wts_file = wts_file_opt.value();
-  } else {
-    std::filesystem::path wtsFileFullName =
-        context->get_log_dir() / constants_file_name_;
-    wts_file = vaip_core::slurp_binary_c8(wtsFileFullName);
-  }
+  wts_file = wts_file_opt.value();
 
   auto const_info = meta_def->vaiml_param().const_data_info();
   wts_buffers_.resize(const_info.size());

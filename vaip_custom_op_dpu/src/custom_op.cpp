@@ -55,6 +55,7 @@
 #include <xir/graph/graph.hpp>
 #include <xir/attrs/attrs.hpp>
 #include "dlanalyzer.hpp"
+#include "../../vaip/src/qos_updater.hpp"
 
 #ifdef VART_IN_BUILD_TREE
 #include <vitis/ai/trace.hpp>
@@ -332,7 +333,13 @@ MyCustomOp::MyCustomOp(std::shared_ptr<const PassContext> context,
         std::string qos_string = it->second;
         try {
           std::uint32_t qos_int = std::atoi(qos_string.c_str());
-          qos_map[param] = qos_int;
+          // When priority is set, set perf_pref to 1 to enable efficient mode.
+          // qos_map will be used either by share_context or GE.
+          if (param == "priority") {
+            qos_map["perf_pref"] = 1;
+          } else {
+            qos_map[param] = qos_int;
+          }
         } catch (std::exception& e) {
           LOG(WARNING) << "Failed to convert qos param :" << param
                        << " from string to int : " << e.what();
@@ -340,92 +347,40 @@ MyCustomOp::MyCustomOp(std::shared_ptr<const PassContext> context,
       }
     }
 
-    // get QoS info from subgraph
-    // This function logic basically originates from GE, as referenced in the
-    // following link.
-    // https://gitenterprise.xilinx.com/VitisAI/graph-engine/blob/c4e1132b0c9d05a47dab3175d9dc9d6ed878522b/src/graph-engine/graph_runner.cpp#L615-L630
-    std::map<std::string, std::uint32_t> qos_map_share_ctx = qos_map;
-    if (!ENV_PARAM(GET_WORKLOADONARCH_BY_EGOPS)) {
-      if (subgraph_->has_attr("workload")) { // change to workload_on_arch when
-                                             // subgraph has this attr
-        auto workload = subgraph_->get_attr<std::uint64_t>("workload");
-        qos_map_share_ctx["gops"] =
-            static_cast<uint32_t>(std::ceil(workload / 1000000000.0));
-      }
-    } else {
-      std::unordered_map<std::string, std::uint64_t> all_qos =
-          get_qos_from_subgraph(subgraph_);
-      qos_map_share_ctx["gops"] =
-          static_cast<uint32_t>(std::ceil(all_qos["workload"] / 1000000000.0));
-      qos_map_share_ctx["egops"] = static_cast<uint32_t>(
-          std::ceil(all_qos["workload_on_arch"] / 1000000000.0));
-    }
-
-    // like parse_qos_args_and_efficient_mode in GE
-
-    // HighEfficiencyMode and Default are value for different qos keys in vart
-    // api Efficient and Default are value for different session.workload_type
-    // keys in ort sess
-    std::string perf_prefer_key = "session.workload_type";
-    std::string perf_prefer_vart_value;
-    auto sess_cfgs = context->get_config_proto().session_configs();
-    if (sess_cfgs.find(perf_prefer_key) != sess_cfgs.end()) {
-      auto perf_prefer_value = sess_cfgs.at(perf_prefer_key);
-      if (perf_prefer_value != "Efficient" && perf_prefer_value != "Default") {
-        throw std::runtime_error(
-            "Invalid value for session.workload_type in session option: " +
-            perf_prefer_value);
-      } else {
-        perf_pref_run_cached_ = perf_prefer_value;
-        if (perf_prefer_value == "Efficient") {
-          qos_map_share_ctx["perf_pref"] = 1;
-
-          perf_prefer_vart_value = "HighEfficiencyMode";
-        } else {
-          qos_map_share_ctx["perf_pref"] = 0;
-          perf_prefer_vart_value = "Default";
-        }
-      }
-
-    } else {
-      // set perf_prefer_value to "Default" for attrs
-      perf_prefer_vart_value = "Default";
-      qos_map_share_ctx["perf_pref"] = 0;
-      perf_pref_run_cached_ = "Default";
-    }
-    perf_pref_session_cached_ = perf_pref_run_cached_;
-
-    int32_t priority = -1;
-    for (auto& q : qos_map_share_ctx) {
-      if (q.first == "priority") {
-        priority = q.second;
-        // qos_priority_realtime = 0x100,
-        if (static_cast<uint32_t>(0x100) == priority &&
-            qos_map_share_ctx["perf_pref"] == 1) {
-          throw std::runtime_error(
-              "Realtime priority cannot mix with HighEfficiencyMode");
-        }
-      }
-    }
 #ifdef ENABLE_XRT_SHARED_CONTEXT
-
-    //    For shell bg models, we force it to use dpm0 by setting the fps ,
-    //    latency nad gops to a lower value. This is done to avoid deadlock
-    //    ********************Note - This change assumes only shell bg models
-    //    have priority values set.
-    if (cfg_sess_opts.find("priority") != cfg_sess_opts.end()) {
-      qos_map_share_ctx["fps"] = 1;
-      qos_map_share_ctx["latency"] = 20;
-      qos_map_share_ctx["gops"] = 1;
-      MY_LOG(1) << "Setting custom QoS Priority to DPM0";
-    }
     if (share_context_) {
+      // get QoS info from subgraph
+      // This function logic basically originates from GE, as referenced in the
+      // following link.
+      // https://gitenterprise.xilinx.com/VitisAI/graph-engine/blob/c4e1132b0c9d05a47dab3175d9dc9d6ed878522b/src/graph-engine/graph_runner.cpp#L615-L630
+      std::map<std::string, std::uint32_t> qos_map_share_ctx = qos_map;
+      if (!ENV_PARAM(GET_WORKLOADONARCH_BY_EGOPS)) {
+        if (subgraph_->has_attr("workload")) { // change to workload_on_arch
+                                               // when subgraph has this attr
+          auto workload = subgraph_->get_attr<std::uint64_t>("workload");
+          qos_map_share_ctx["gops"] =
+              static_cast<uint32_t>(std::ceil(workload / 1000000000.0));
+        }
+      } else {
+        std::unordered_map<std::string, std::uint64_t> all_qos =
+            get_qos_from_subgraph(subgraph_);
+        qos_map_share_ctx["gops"] = static_cast<uint32_t>(
+            std::ceil(all_qos["workload"] / 1000000000.0));
+        qos_map_share_ctx["egops"] = static_cast<uint32_t>(
+            std::ceil(all_qos["workload_on_arch"] / 1000000000.0));
+      }
+
       MY_LOG(1) << "DPU op using shared context";
       auto device_id = 0;
       auto context_id = i % vaip::Context::MAX_NUM_OF_CONTEXTS;
       runner_holder->context_ = vaip::Context::create_shared_context(
           *context, device_id, context_id, xclbin_file, qos_map_share_ctx);
       runner_holder->context_->update_qos(qos_map_share_ctx);
+      // use XRTUpdateQosImpl object to update efficient mode directly through
+      // xrt::hw_context
+      auto qos_updater = std::make_shared<vaip_core::XRTUpdateQosImpl>(
+          &(runner_holder->context_->xrt_hw_context()));
+      context->add_QosUpdater(qos_updater);
     } else {
       // no share, only the attr is used. For backward compatibility,
       // DO share the attr between multiple dpu op instances
@@ -493,8 +448,6 @@ MyCustomOp::MyCustomOp(std::shared_ptr<const PassContext> context,
     // the env var XLNX_VART_FIRMWARE is not used.
     attrs->set_attr("xclbin_file", xclbin_file);
 #endif
-    // set workload_type in session opt in attrs
-    attrs->set_attr("performance_preference", perf_prefer_vart_value);
 
     if (ENV_PARAM(USE_GRAPH_ENGINE)) {
       // XLNX_ENABLE_GRAPH_ENGINE_PAD == 0 means data has been paded
@@ -525,31 +478,19 @@ MyCustomOp::MyCustomOp(std::shared_ptr<const PassContext> context,
     if (!ge_ctx_id.empty()) {
       attrs->set_attr<int>("ctx_idx", std::atoi(ge_ctx_id.c_str()));
     }
-    std::unique_ptr<vart::RunnerExt> vart_runner{nullptr};
-    vart_support_eff_mode_ = true;
+
     try {
-      vart_runner = std::move(vart::RunnerExt::create_runner(subgraph_, attrs));
-    } catch (std::exception& e) {
-      // reset ctx_idx otherwise will cause the error here:
-      // https://gitenterprise.xilinx.com/VitisAI/graph-engine/blob/bc58a3fb8b590970712917840c5821a1cc8d2609/src/graph-engine/graph_runner.cpp#L640-L645
-      if (!ge_ctx_id.empty()) {
-        attrs->set_attr<int>("ctx_idx", std::atoi(ge_ctx_id.c_str()));
-      } else {
-        attrs->del_attr("ctx_idx");
+      auto vart_runner = vart::RunnerExt::create_runner(subgraph_, attrs);
+      if (!share_context_) {
+        auto ge_update_qos_impl =
+            std::make_shared<vaip_core::GEUpdateQosImpl>(vart_runner.get());
+        context->add_QosUpdater(ge_update_qos_impl);
       }
 
-      if (std::string(e.what()).find("perf_pref") != std::string::npos) {
-        LOG(WARNING) << "XRT device doesn't support efficient mode, will "
-                        "ignore the QoS request.";
-        attrs->del_attr("performance_preference");
-        vart_runner =
-            std::move(vart::RunnerExt::create_runner(subgraph_, attrs));
-        vart_support_eff_mode_ = false;
-      } else {
-        LOG(FATAL) << "-- Error: Failed to create GE handle: " << e.what();
-      }
+      runner_holder->runner_ = std::move(vart_runner);
+    } catch (std::exception& e) {
+      LOG(FATAL) << "-- Error: Failed to create GE handle: " << e.what();
     }
-    runner_holder->runner_ = std::move(vart_runner);
     runners.push_back(std::move(runner_holder));
   }
   runnerRequestsQueue_ =
@@ -569,65 +510,6 @@ void MyCustomOp::Compute(const OrtApi* api, OrtKernelContext* context) const {
   auto runner_request = runnerRequestsQueue_->getIdleRequest();
   __TOC__(GET_RUNNER);
   auto runner = runner_request->runner_.get();
-
-  std::string perf_pref_value =
-      context_->get_run_option("run.workload_type", "not_set");
-  if (perf_pref_value != "Efficient" && perf_pref_value != "Default" &&
-      perf_pref_value != "not_set") {
-    throw std::runtime_error(
-        "Invalid value for session.workload_type in session option: " +
-        perf_pref_value);
-  }
-
-#ifdef ENABLE_XRT_SHARED_CONTEXT
-  if (share_context_) {
-    MY_LOG(1) << "DPU Kernel using shared context"
-              << "\n";
-    if (perf_pref_value != "not_set" &&
-        perf_pref_value != perf_pref_run_cached_) {
-      // Note(xcl) if efficient model is supported in XRT driver,
-      // update_qos_for_run_opt will do nothing internally
-      runner_request->context_->update_qos_for_run_opt(perf_pref_value);
-      perf_pref_run_cached_ = perf_pref_value;
-    } else if (perf_pref_value == "not_set" &&
-               perf_pref_run_cached_ != perf_pref_session_cached_) {
-      // Note(xcl) if efficient model is supported in XRT driver,
-      // update_qos_for_run_opt will do nothing internally
-      runner_request->context_->update_qos_for_run_opt(
-          perf_pref_session_cached_);
-      perf_pref_run_cached_ = perf_pref_session_cached_;
-    }
-  }
-#endif
-  if (!share_context_ && vart_support_eff_mode_) {
-    std::shared_ptr<xir::Attrs> attrs = xir::Attrs::create();
-    if (perf_pref_value != "not_set" &&
-        perf_pref_value != perf_pref_run_cached_) {
-
-      if (perf_pref_value == "Default") {
-        attrs->set_attr<std::string>("performance_preference", "Default");
-      } else {
-        attrs->set_attr<std::string>("performance_preference",
-                                     "HighEfficiencyMode");
-      }
-
-      auto unique_attrs = xir::Attrs::clone(attrs.get());
-      runner->set_run_attrs(unique_attrs);
-      perf_pref_run_cached_ = perf_pref_value;
-    } else if (perf_pref_value == "not_set" &&
-               perf_pref_run_cached_ != perf_pref_session_cached_) {
-      if (perf_pref_session_cached_ == "Default") {
-        attrs->set_attr<std::string>("performance_preference", "Default");
-      } else {
-        attrs->set_attr<std::string>("performance_preference",
-                                     "HighEfficiencyMode");
-      }
-
-      auto unique_attrs = xir::Attrs::clone(attrs.get());
-      runner->set_run_attrs(unique_attrs);
-      perf_pref_run_cached_ = perf_pref_session_cached_;
-    }
-  }
 
   __TIC__(COMPUTE);
   MY_LOG(1) << "dpu kernel " << subgraph_->get_name() << "\n";

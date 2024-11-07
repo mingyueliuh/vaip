@@ -30,6 +30,7 @@
  * NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE,
  * EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE
  */
+#define _CRT_SECURE_NO_WARNINGS
 #include <fstream>
 #include <google/protobuf/util/json_util.h>
 
@@ -195,26 +196,59 @@ PassContextImp::get_session_config(const std::string& option_name,
   return default_value;
 }
 
+extern thread_local const void* g_state;
+extern thread_local vaip_core::DllSafe<std::string> (*g_get_config_entry)(
+    const void* state, const char* entry_name);
 std::string
 PassContextImp::get_run_option(const std::string& option_name,
                                const std::string& default_value) const {
-  auto ret = default_value;
-  if (get_run_options_) {
-    // if the function exists. TODO, it might be a stale
-    // function.
-    auto maybe_value = get_run_options_(option_name);
-    if (maybe_value) {
-      ret = maybe_value.value();
+  // set the default value.
+  std::string ret = default_value;
+  if (g_state) {
+    auto dll_string = g_get_config_entry(g_state, option_name.data());
+    if (dll_string.get() != nullptr) {
+      ret = std::string(*dll_string);
     }
+    return ret;
   }
   return ret;
 }
+
+std::string
+PassContextImp::get_ep_dynamic_option(const std::string& option_name,
+                                      const std::string& default_value) const {
+  std::lock_guard<std::mutex> lock(this->ep_dynamic_options_lock);
+  auto it = ep_dynamic_options.find(option_name);
+  if (it == ep_dynamic_options.end()) {
+    return default_value;
+  } else {
+    return it->second;
+  }
+}
+
+void PassContextImp::add_QosUpdater(
+    const std::shared_ptr<QoSUpdateInterface>& updater) const {
+  CHECK(updater) << "Null QoS updater cannot be added to PassContext";
+  qos_updaters_.push_back(updater);
+}
+
+void PassContextImp::update_all_qos(const std::string& workload_type) const {
+  if (workload_type == "Efficient" || workload_type == "Default") {
+    for (const auto& updater : qos_updaters_) {
+      CHECK(updater) << "Found null QoS updater in qos_updaters_";
+      updater->update_qos(workload_type);
+    }
+  } else {
+    throw std::runtime_error("Invalid workload type: " + workload_type);
+  }
+}
+
 template <typename char_type> struct binary_io {
   static std::vector<char_type> slurp_binary(FILE* file) {
-    CHECK(fseek(file, 0, SEEK_SET) == 0);
-    CHECK(fseek(file, 0, SEEK_END) == 0);
-    auto size = ftell(file);
-    CHECK(fseek(file, 0, SEEK_SET) == 0);
+    CHECK(fseek64(file, 0, SEEK_SET) == 0);
+    CHECK(fseek64(file, 0, SEEK_END) == 0);
+    auto size = ftell64(file);
+    CHECK(fseek64(file, 0, SEEK_SET) == 0);
     auto buffer = std::vector<char_type>((size_t)size / sizeof(char_type));
     if (size != 0) {
       CHECK(fread(buffer.data(), 1, size, file) == static_cast<size_t>(size));
@@ -222,30 +256,144 @@ template <typename char_type> struct binary_io {
     return buffer;
   }
 };
+
 template <typename T>
 std::optional<std::vector<T>>
-read_file(const std::map<std::string, FILE*>& cache_files,
-          const std::string& filename) {
-  auto ret = std::optional<std::vector<T>>();
-  auto it = cache_files.find(filename);
-  if (it != cache_files.end()) {
-    ret = binary_io<T>::slurp_binary(it->second);
+PassContextImp::read_file_generic(const std::string& filename) const {
+  std::optional<std::vector<T>> ret;
+  auto stream = open_file_for_read(filename);
+  if (stream == nullptr) {
+    return std::nullopt;
   }
-  LOG_IF(INFO, ENV_PARAM(DEBUG_TAR_CACHE))
-      << "read " << filename << " "
-      << (ret.has_value() ? std::to_string(ret.value().size()) : "N/A")
-      << " bytes from the cache files.";
+  constexpr size_t buffer_size = 8196;
+  char tmp[buffer_size];
+  ret = std::vector<T>();
+  ret.value().reserve(buffer_size);
+  size_t read_count = 0;
+  do {
+    read_count = stream->fread(&tmp, buffer_size);
+    ret.value().insert(ret.value().end(), tmp, tmp + read_count);
+  } while (read_count != 0);
+  LOG_IF(FATAL, !ret.has_value())
+      << "can't read " << filename << " in the cache object.";
   return ret;
 }
-
 std::optional<std::vector<char>>
 PassContextImp::read_file_c8(const std::string& filename) const {
-  return read_file<char>(cache_files_, filename);
+  return read_file_generic<char>(filename);
 }
 
 std::optional<std::vector<uint8_t>>
 PassContextImp::read_file_u8(const std::string& filename) const {
-  return read_file<uint8_t>(cache_files_, filename);
+  return read_file_generic<uint8_t>(filename);
+}
+
+std::unique_ptr<CacheFileReader>
+PassContextImp::open_file_for_read(const std::string& filename) const {
+  std::unique_ptr<CacheFileReader> ret = nullptr;
+  auto in_mem = cache_in_mem();
+  auto& cace_files =
+      const_cast<std::remove_cv_t<decltype(cache_files_)&>>(cache_files_);
+  auto it = cace_files.find(filename);
+  if (it != cace_files.end()) {
+    if (in_mem) {
+      LOG_IF(INFO, ENV_PARAM(DEBUG_TAR_CACHE))
+          << "tmp file opened: " << filename;
+      ret = std::unique_ptr<CacheFileReader>(
+          new CacheFileReaderImp(in_mem, filename, it->second));
+    } else {
+      FILE* fp = std::freopen((get_log_dir() / filename).u8string().c_str(),
+                              "rb+", it->second);
+      if (fp == nullptr) {
+        LOG_IF(INFO, ENV_PARAM(DEBUG_TAR_CACHE))
+            << " cannot freopen " << filename;
+      } else {
+        it->second = fp;
+        ret = std::unique_ptr<CacheFileReader>(
+            new CacheFileReaderImp(in_mem, filename, it->second));
+      }
+    }
+  } else {
+    if (!in_mem) {
+      FILE* fp =
+          std::fopen((get_log_dir() / filename).u8string().c_str(), "rb+");
+      if (fp == nullptr) {
+        LOG_IF(INFO, ENV_PARAM(DEBUG_TAR_CACHE))
+            << " cannot freopen " << filename;
+      } else {
+        cace_files[filename] = fp;
+        ret = std::unique_ptr<CacheFileReader>(
+            new CacheFileReaderImp(in_mem, filename, fp));
+      }
+    } else {
+      LOG_IF(INFO, ENV_PARAM(DEBUG_TAR_CACHE))
+          << "tmp file open failed: cannot found " << filename
+          << ". try to use write_file_for_write before reading.";
+      ret = nullptr;
+    }
+  }
+  return ret;
+}
+
+std::unique_ptr<CacheFileWriter>
+PassContextImp::open_file_for_write(const std::string& filename) {
+  std::unique_ptr<CacheFileWriter> ret = nullptr;
+  auto it = cache_files_.find(filename);
+  FILE* tmp_file = nullptr;
+  auto in_mem = cache_in_mem();
+  if (it != cache_files_.end()) {
+    if (in_mem) {
+      fclose(it->second);
+      LOG_IF(INFO, ENV_PARAM(DEBUG_TAR_CACHE))
+          << "tmp file write: " << filename;
+      tmp_file = tmpfile();
+      if (tmp_file == nullptr) {
+        LOG_IF(INFO, ENV_PARAM(DEBUG_TAR_CACHE))
+            << " cannot create tmp file " << filename;
+      } else {
+        it->second = tmp_file;
+        return std::unique_ptr<CacheFileWriter>(
+            new CacheFileWriterImp(in_mem, filename, it->second));
+      }
+    } else {
+      FILE* fp = std::freopen((get_log_dir() / filename).u8string().c_str(),
+                              "wb+", it->second);
+      if (fp == nullptr) {
+        LOG_IF(INFO, ENV_PARAM(DEBUG_TAR_CACHE))
+            << " cannot freopen " << filename;
+      } else {
+        it->second = fp;
+        return std::unique_ptr<CacheFileWriter>(
+            new CacheFileWriterImp(in_mem, filename, fp));
+      }
+    }
+  } else {
+    if (in_mem) {
+      LOG_IF(INFO, ENV_PARAM(DEBUG_TAR_CACHE))
+          << "tmp file write: " << filename;
+      tmp_file = tmpfile();
+      if (tmp_file == nullptr) {
+        LOG_IF(INFO, ENV_PARAM(DEBUG_TAR_CACHE))
+            << "cannot create tmp file" << filename;
+      } else {
+        cache_files_[filename] = tmp_file;
+        ret = std::unique_ptr<CacheFileWriter>(
+            new CacheFileWriterImp(in_mem, filename, tmp_file));
+      }
+    } else {
+      tmp_file =
+          std::fopen((get_log_dir() / filename).u8string().c_str(), "wb+");
+      if (tmp_file == nullptr) {
+        LOG_IF(INFO, ENV_PARAM(DEBUG_TAR_CACHE))
+            << " fopen failed. " << filename;
+      } else {
+        cache_files_[filename] = tmp_file;
+        ret = std::unique_ptr<CacheFileWriter>(
+            new CacheFileWriterImp(in_mem, filename, tmp_file));
+      }
+    }
+  }
+  return ret;
 }
 
 FILE* PassContextImp::open_file(const std::string& filename) const {
@@ -259,47 +407,36 @@ FILE* PassContextImp::open_file(const std::string& filename) const {
   return nullptr;
 }
 
+bool write_to_cache_files(std::map<std::string, FILE*>& cache_files,
+                          const std::string& filename,
+                          gsl::span<const char> data) {
+  auto iter = cache_files.find(filename);
+  if (iter != cache_files.end()) {
+    fclose(iter->second);
+  }
+  cache_files[filename] = write_to_tmp_file(data);
+  return true;
+}
 bool PassContextImp::write_file(const std::string& filename,
                                 gsl::span<const char> data) {
+  bool ret = true;
+  auto stream = open_file_for_write(filename);
+  CHECK(stream != nullptr) << "cannot open " << filename << " for write";
+  if (!data.empty()) {
+    CHECK(stream->fwrite(data.data(), data.size()) == data.size())
+        << "failed to write " << filename;
+  }
+  stream = nullptr; // close file
   LOG_IF(INFO, ENV_PARAM(DEBUG_TAR_CACHE))
       << "write " << filename << " " << data.size()
       << " bytes to the cache files";
-  auto iter = cache_files_.find(filename);
-  if (iter != cache_files_.end()) {
-    fclose(iter->second);
-  }
-  cache_files_[filename] = write_to_tmp_file(data);
-  return true;
-}
-
-void PassContextImp::write_tmpfile(const std::string& filename, FILE* file) {
-  LOG_IF(INFO, ENV_PARAM(DEBUG_TAR_CACHE)) << "write tempfile: " << filename;
-  auto iter = cache_files_.find(filename);
-  if (iter != cache_files_.end()) {
-    LOG_IF(INFO, ENV_PARAM(DEBUG_TAR_CACHE))
-        << "overwrite tempfile: " << filename;
-    fclose(iter->second);
-  }
-  cache_files_[filename] = file;
+  return ret;
 }
 
 bool PassContextImp::has_cache_file(const std::string& filename) const {
   return cache_files_.find(filename) != cache_files_.end();
 }
 
-void PassContextImp::directory_to_cache_files(
-    const std::filesystem::path& dir) {
-  LOG_IF(INFO, ENV_PARAM(DEBUG_TAR_CACHE))
-      << " Begin of tar cache " << dir.string();
-  for (const auto& f : fs::recursive_directory_iterator(dir)) {
-    if (fs::is_regular_file(f.path())) {
-      auto relative_path = std::filesystem::relative(f, dir);
-      auto buffer = read_file_to_buffer(f.path());
-      write_file(relative_path.string(), buffer);
-    }
-  }
-  LOG_IF(INFO, ENV_PARAM(DEBUG_TAR_CACHE)) << " End of tar cache ";
-}
 std::vector<char> PassContextImp::cache_files_to_tar_mem() {
   std::ostringstream buf(std::ios::binary);
   for (const auto& iter : cache_files_) {
@@ -341,30 +478,9 @@ bool PassContextImp::tar_mem_to_cache_files(const char* buffer, size_t size) {
     LOG_IF(INFO, ENV_PARAM(DEBUG_TAR_CACHE))
         << "load " << filename << " " << data.size() << " bytes";
     gsl::span<char> data_span = gsl::span<char>(data);
-    cache_files_[filename] = write_to_tmp_file(data_span);
+    write_file(filename, data_span);
   }
   return true;
-}
-
-void PassContextImp::cache_files_to_directory(
-    const std::filesystem::path& dir) {
-  LOG_IF(INFO, ENV_PARAM(DEBUG_TAR_CACHE)) << " Begin of untar cache ";
-  for (const auto& [filename, file] : cache_files_) {
-    auto full_filename = dir / filename;
-    if (!std::filesystem::exists(full_filename.parent_path())) {
-      std::filesystem::create_directories(full_filename.parent_path());
-    }
-    auto data = read_file_c8(filename).value();
-    LOG_IF(INFO, ENV_PARAM(DEBUG_TAR_CACHE))
-        << "wirte file " << full_filename.string() << " " << data.size()
-        << " bytes";
-    std::ofstream stream(full_filename.string(), std::ios::binary);
-    if (!data.empty()) {
-      CHECK(stream.write(&data[0], data.size()).good())
-          << "failed to write " << filename;
-    }
-  }
-  LOG_IF(INFO, ENV_PARAM(DEBUG_TAR_CACHE)) << " End of untar cache ";
 }
 
 std::filesystem::path PassContextImp::xclbin_path_to_cache_files(
@@ -390,28 +506,14 @@ std::filesystem::path PassContextImp::xclbin_path_to_cache_files(
         << "Xclbin path doesn't exist, are you running with cpu runner?";
     return path;
   }
-  if (in_mem) {
-    const_cast<PassContextImp*>(this)->write_file(filename, buffer);
-  } else {
-    std::ofstream stream(ret, std::ios::binary);
-    CHECK(stream.write(buffer.data(), buffer.size()).good())
-        << "failed to write " << filename;
-  }
+  const_cast<PassContextImp*>(this)->write_file(filename, buffer);
   return ret;
 }
 
 std::optional<std::vector<char>>
 PassContextImp::read_xclbin(const std::filesystem::path& path) const {
   auto filename = path.filename().u8string();
-  auto ret = std::optional<std::vector<char>>();
-  if (auto xclbin_in_mem_cache = read_file_c8(filename)) {
-    ret = xclbin_in_mem_cache.value();
-  } else if (std::filesystem::exists(path)) {
-    auto buffer = slurp_binary_c8(path);
-    const_cast<PassContextImp*>(this)->write_file(filename, buffer);
-    ret = buffer;
-  }
-  return ret;
+  return read_file_c8(filename);
 }
 
 const ConfigProto& PassContextImp::get_config_proto() const {
@@ -424,14 +526,7 @@ void PassContextImp::save_context_json() const {
   proto.mutable_config()->clear_encryption_key();
   try {
     auto json_str = msg_to_json_string(proto);
-    bool in_mem = cache_in_mem();
-    if (!in_mem) {
-      auto filename = get_log_dir() / "context.json";
-      CHECK(std::ofstream(filename).write(&json_str[0], json_str.size()).good())
-          << "failed to write " << filename;
-    } else {
-      const_cast<PassContextImp*>(this)->write_file("context.json", json_str);
-    }
+    const_cast<PassContextImp*>(this)->write_file("context.json", json_str);
   } catch (const std::exception& e) {
     std::cerr << "exception occurs : " << e.what() << "\n";
   }
@@ -511,4 +606,40 @@ PassContextTimerImp::~PassContextTimerImp() {
 std::unique_ptr<PassContext> PassContext::create() {
   return std::make_unique<PassContextImp>();
 }
+
+CacheFileReaderImp::CacheFileReaderImp(bool in_mem, const std::string& filename,
+                                       FILE* fp)
+    : CacheFileReader(), in_mem_(in_mem), name_{filename}, fp_{fp} {
+  std::rewind(fp);
+  LOG_IF(INFO, ENV_PARAM(DEBUG_TAR_CACHE))
+      << "open " << filename << " for read";
+}
+
+CacheFileReaderImp::~CacheFileReaderImp() {
+  LOG_IF(INFO, ENV_PARAM(DEBUG_TAR_CACHE)) << "close " << name_ << " for read";
+}
+
+std::size_t CacheFileReaderImp::fread(void* buffer, std::size_t size) const {
+  auto ret = std::fread(buffer, 1u, size, fp_);
+  return ret;
+}
+
+CacheFileWriterImp::CacheFileWriterImp(bool in_mem, const std::string& filename,
+                                       FILE* fp)
+    : CacheFileWriter(), in_mem_(in_mem), name_{filename}, fp_{fp} {
+  LOG_IF(INFO, ENV_PARAM(DEBUG_TAR_CACHE))
+      << "open " << filename << " for write";
+}
+
+CacheFileWriterImp::~CacheFileWriterImp() {
+  LOG_IF(INFO, ENV_PARAM(DEBUG_TAR_CACHE)) << "close " << name_ << " for write";
+  std::fflush(fp_);
+}
+
+std::size_t CacheFileWriterImp::fwrite(const void* buffer,
+                                       std::size_t size) const {
+  auto ret = std::fwrite(buffer, 1u, size, fp_);
+  return ret;
+}
+
 } // namespace vaip_core

@@ -61,45 +61,23 @@ MyCustomOp::MyCustomOp(std::shared_ptr<const PassContext> context,
   auto data_file = dd_cache_dir / meta_def->generic_param().at("data_file");
   auto data_file_opt = context->read_file_c8(
       std::filesystem::path(data_file).filename().string());
-  if (data_file_opt.has_value()) {
-    auto file = data_file_opt.value();
-    in_data_.resize(file.size() / sizeof(uint8_t));
-    memcpy(in_data_.data(), file.data(), file.size());
-
-  } else {
-    std::ifstream file(data_file.u8string(), std::ios::binary);
-    file.seekg(0, std::ios::end);
-    std::streamsize size = file.tellg();
-    file.seekg(0, std::ios::beg);
-    in_data_.resize(size / sizeof(uint8_t));
-
-    if (!file.read(reinterpret_cast<char*>(in_data_.data()), size)) {
-      std::cerr << "Error reading data file!" << std::endl;
-    }
-    file.close();
+  if (!data_file_opt.has_value()) {
+    std::cerr << "Error reading file: " << data_file << std::endl;
   }
+  auto file = data_file_opt.value();
+  in_data_.resize(file.size() / sizeof(uint8_t));
+  memcpy(in_data_.data(), file.data(), file.size());
 
   auto wts_file = dd_cache_dir / meta_def->generic_param().at("wts_file");
   std::vector<uint8_t> wts_data_tmp;
   std::streamsize sizew;
   auto wts_data_opt = context->read_file_u8(
       std::filesystem::path(wts_file).filename().string());
-  if (wts_data_opt.has_value()) {
-    wts_data_tmp = wts_data_opt.value();
-    sizew = wts_data_tmp.size();
-  } else {
-    std::ifstream filew(wts_file.u8string(), std::ios::binary);
-    filew.seekg(0, std::ios::end);
-    sizew = filew.tellg();
-    filew.seekg(0, std::ios::beg);
-    std::vector<uint8_t> wts_data_tmp;
-    wts_data_tmp.resize(sizew / sizeof(uint8_t));
-
-    if (!filew.read(reinterpret_cast<char*>(wts_data_tmp.data()), sizew)) {
-      std::cerr << "Error reading data file!" << std::endl;
-    }
-    filew.close();
+  if (!wts_data_opt.has_value()) {
+    std::cerr << "Error reading file: " << wts_file << std::endl;
   }
+  wts_data_tmp = wts_data_opt.value();
+  sizew = wts_data_tmp.size();
   wts_data_.resize(sizew / sizeof(uint8_t));
   for (int i = 0; i < sizew; i++)
     wts_data_[i] = ((float)wts_data_tmp[i] - wt_zp_) * wt_scale_;

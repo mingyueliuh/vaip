@@ -51,41 +51,22 @@ GraphHolder::GraphHolder(const vaip_core::PassContext& context,
   auto path = log_dir / filename;
   auto full_filename = path.u8string();
   auto maybe_xmodel_content = context.read_file_c8(filename);
-  if (maybe_xmodel_content.has_value()) {
-    auto xmodel_context = maybe_xmodel_content.value();
-    std::string s;
-    if (decryption_key != "") {
-      // TODO : aes_decryption change the first argument to accecpt gsl::span,
-      // not vector<char>
-      s = vaip_encryption::aes_decryption(
-          std::string(xmodel_context.begin(), xmodel_context.end()),
-          decryption_key);
-      graph_ = xir::Graph::deserialize_from_memory(s.data(), s.size());
-    } else {
-      graph_ = xir::Graph::deserialize_from_memory(xmodel_context.data(),
-                                                   xmodel_context.size());
-    }
-    init_subgraph();
+  CHECK(maybe_xmodel_content.has_value())
+      << "read cache file error: can't read " << filename;
+  auto xmodel_context = maybe_xmodel_content.value();
+  std::string s;
+  if (decryption_key != "") {
+    // TODO : aes_decryption change the first argument to accecpt gsl::span,
+    // not vector<char>
+    s = vaip_encryption::aes_decryption(
+        std::string(xmodel_context.begin(), xmodel_context.end()),
+        decryption_key);
+    graph_ = xir::Graph::deserialize_from_memory(s.data(), s.size());
   } else {
-    std::ifstream ifs(full_filename, std::ios::binary);
-    std::string s;
-    CHECK(ifs.good()) << "cannot open file" << filename;
-    if (decryption_key != "") {
-      std::vector<char> file_char_array((std::istreambuf_iterator<char>(ifs)),
-                                        std::istreambuf_iterator<char>());
-      ifs.close();
-      s = std::string(file_char_array.begin(), file_char_array.end());
-      s = vaip_encryption::aes_decryption(s, decryption_key);
-    } else {
-      ifs.seekg(0, std::ios_base::end);
-      auto size = ifs.tellg();
-      ifs.seekg(0, std::ios_base::beg);
-      s.resize(size);
-      ifs.read(s.data(), size);
-    }
-    graph_ = xir::Graph::deserialize_from_string(s);
-    init_subgraph();
+    graph_ = xir::Graph::deserialize_from_memory(xmodel_context.data(),
+                                                 xmodel_context.size());
   }
+  init_subgraph();
 }
 
 void GraphHolder::init_subgraph() {

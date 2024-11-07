@@ -124,18 +124,10 @@ struct Dd_merge_dqcastgather {
           std::string data_bin = name + ".bin";
           auto path = log_dir / data_bin;
           std::string data_file{path.u8string()};
-          bool in_mem = self_.get_context()->cache_in_mem();
-          if (in_mem) {
-            auto char_data = gsl::span<const char>(
-                reinterpret_cast<const char*>(in_data.data()),
-                in_data.size() * sizeof(int8_t));
-            self_.get_context()->write_file(data_bin, char_data);
-          } else {
-            std::ofstream file(data_file, std::ios::binary);
-            file.write(reinterpret_cast<const char*>(in_data.data()),
-                       in_data.size() * sizeof(int8_t));
-            file.close();
-          }
+          auto char_data = gsl::span<const char>(
+              reinterpret_cast<const char*>(in_data.data()),
+              in_data.size() * sizeof(int8_t));
+          self_.get_context()->write_file(data_bin, char_data);
 
           std::string zp_name = node_arg_get_name(*in_zp_node.node_arg);
           zp_name.erase(std::remove_if(zp_name.begin(), zp_name.end(),
@@ -149,17 +141,10 @@ struct Dd_merge_dqcastgather {
           std::string zp_bin = zp_name + ".bin";
           auto zp_path = log_dir / zp_bin;
           std::string zp_file{zp_path.u8string()};
-          if (in_mem) {
-            auto char_data = gsl::span<const char>(
-                reinterpret_cast<const char*>(in_zero_point.data()),
-                in_zero_point.size() * sizeof(int8_t));
-            self_.get_context()->write_file(zp_bin, char_data);
-          } else {
-            std::ofstream file_zp(zp_file, std::ios::binary);
-            file_zp.write(reinterpret_cast<const char*>(in_zero_point.data()),
-                          in_zero_point.size() * sizeof(int8_t));
-            file_zp.close();
-          }
+          char_data = gsl::span<const char>(
+              reinterpret_cast<const char*>(in_zero_point.data()),
+              in_zero_point.size() * sizeof(int8_t));
+          self_.get_context()->write_file(zp_bin, char_data);
 
           auto node_name = node_arg_get_name(*out_node.node_arg);
           std::vector<std::string> inputs = {

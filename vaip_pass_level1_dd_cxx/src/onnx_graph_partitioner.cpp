@@ -204,8 +204,8 @@ partition_onnx_model(onnxruntime::Graph& graph) {
       adjacency_list[(int32_t)node_idx] = successors;
     }
   }
-  writeAdjacencyListToFile(adjacency_list, "mdsqr_adj.txt");
-  writeResToFile(idx_node_map);
+  // writeAdjacencyListToFile(adjacency_list, "mdsqr_adj.txt");
+  // writeResToFile(idx_node_map);
 
   dd::label_map subgraphs =
       dd::partition_graph(adjacency_list, property, "L1", nodes);

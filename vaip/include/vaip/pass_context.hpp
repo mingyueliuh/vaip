@@ -74,8 +74,29 @@ public:
   PassContextTimer();
   virtual ~PassContextTimer();
 };
+class CacheFileReader {
+public:
+  CacheFileReader() = default;
+  CacheFileReader(const CacheFileReader&) = delete;
+  virtual ~CacheFileReader() = default;
+  virtual std::size_t fread(void* buffer, std::size_t size) const = 0;
+};
+class CacheFileWriter {
+public:
+  CacheFileWriter() = default;
+  CacheFileWriter(const CacheFileWriter&) = delete;
+  virtual ~CacheFileWriter() = default;
+  virtual std::size_t fwrite(const void* buffer, std::size_t size) const = 0;
+};
+
+class QoSUpdateInterface {
+public:
+  virtual ~QoSUpdateInterface() = default;
+  virtual void update_qos(const std::string& perf_pref_value) = 0;
+};
 
 class PassContext {
+public:
 public:
   virtual ~PassContext() = default;
   /**
@@ -191,6 +212,14 @@ public:
   virtual std::string
   get_run_option(const std::string& option_name,
                  const std::string& default_value) const = 0;
+
+  virtual std::string
+  get_ep_dynamic_option(const std::string& option_name,
+                        const std::string& default_value) const = 0;
+
+  virtual void
+  add_QosUpdater(const std::shared_ptr<QoSUpdateInterface>& updater) const = 0;
+  virtual void update_all_qos(const std::string& workload_type) const = 0;
   /**
    * @brief Retrieves the configuration protobuf object.
    *
@@ -208,6 +237,7 @@ public:
   // @brief DO NOT USE THIS FUNCTION
   virtual std::shared_ptr<void>
   get_context_resource(const std::string& name) const = 0;
+
   /**
    * @brief Reads in-memory cache files into bytes
    *
@@ -222,6 +252,11 @@ public:
   virtual std::optional<std::vector<uint8_t>>
   read_file_u8(const std::string& filename) const = 0;
 
+  virtual std::unique_ptr<CacheFileReader>
+  open_file_for_read(const std::string& filename) const = 0;
+  virtual std::unique_ptr<CacheFileWriter>
+  open_file_for_write(const std::string& filename) = 0;
+
   virtual FILE* open_file(const std::string& filename) const = 0;
 
   /**
@@ -234,7 +269,6 @@ public:
    */
   virtual bool write_file(const std::string& filename,
                           gsl::span<const char> data) = 0;
-  virtual void write_tmpfile(const std::string& filename, FILE* file) = 0;
 
   /**
    * @brief Checks if a cache file with the given filename exists.
@@ -294,20 +328,6 @@ public:
    */
   virtual bool tar_mem_to_cache_files(const char* data, size_t size) = 0;
 
-  /**
-   * @brief Loads files from a directory and create in-memory cache files from
-   * them.
-   *
-   * @param dir The directory path.
-   */
-  virtual void directory_to_cache_files(const std::filesystem::path& dir) = 0;
-
-  /**
-   * @brief Saves in-memory cache files to the specified directory.
-   *
-   * @param dir The directory path.
-   */
-  virtual void cache_files_to_directory(const std::filesystem::path& dir) = 0;
   /**
    * @brief Creates a new instance of PassContext.
    *

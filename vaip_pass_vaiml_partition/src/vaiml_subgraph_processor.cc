@@ -532,22 +532,9 @@ VaimlSubgraphProcessor::GetSupportedNodes(const Graph& graph) const {
 int VaimlSubgraphProcessor::saveMemoryToCache(const char* mem, size_t mem_size,
                                               std::filesystem::path cache_dir,
                                               std::string filename) {
-  bool in_mem = self_.get_context()->cache_in_mem();
-  auto filepath = cache_dir / (filename + ".bin");
-  if (in_mem) {
-    self_.get_context()->write_file(filename + ".bin",
-                                    gsl::span<const char>(mem, mem_size));
-  } else {
-    std::ofstream ofsFile(filepath, std::ios::binary);
-    if (!ofsFile) {
-      std::cerr << "Error opening file for writing." << std::endl;
-      return 1;
-    }
-    ofsFile.write(mem, mem_size);
-    ofsFile.close();
-  }
-
-  VAIML_DEBUG_PRINT(mem_size, " bytes of memory saved to cache ", filepath);
+  self_.get_context()->write_file(filename + ".bin",
+                                  gsl::span<const char>(mem, mem_size));
+  VAIML_DEBUG_PRINT(mem_size, " bytes of memory saved to cache ", filename);
   return 0;
 }
 
@@ -895,20 +882,9 @@ void VaimlSubgraphProcessor::dumpConstants(const Graph& graph) {
   std::filesystem::path fullCntsFileName = cache_dir_ / constants_file_name_;
   VAIML_DEBUG_PRINT("VaimlSubgraphProcessor::dumpConstants to :",
                     fullCntsFileName);
-  bool in_mem = self_.get_context()->cache_in_mem();
 
-  std::unique_ptr<std::ostream> cnts_file;
-  if (in_mem) {
-    cnts_file = std::make_unique<std::ostringstream>();
-  } else {
-    auto f =
-        std::make_unique<std::ofstream>(fullCntsFileName, std::ios::binary);
-    // Check if the file is open
-    if (!f->is_open()) {
-      throw std::runtime_error("Failed to open the constant file for writing.");
-    }
-    cnts_file = std::move(f);
-  }
+  std::unique_ptr<std::ostream> cnts_file =
+      std::make_unique<std::ostringstream>();
   size_t cnt_offset = 0;
   auto all_constants = VAIP_ORT_API(graph_get_all_initialized_tensors)(graph_);
   auto cxx_graph = vaip_cxx::GraphConstRef(graph_);
@@ -997,10 +973,8 @@ void VaimlSubgraphProcessor::dumpConstants(const Graph& graph) {
     //                    constants_map_[constant.first].offset);
   }
 
-  if (in_mem) {
-    auto charStream = dynamic_cast<std::ostringstream*>(cnts_file.get());
-    self_.get_context()->write_file(constants_file_name_, charStream->str());
-  }
+  auto charStream = dynamic_cast<std::ostringstream*>(cnts_file.get());
+  self_.get_context()->write_file(constants_file_name_, charStream->str());
 }
 
 std::vector<std::unique_ptr<IndexedSubGraph>>

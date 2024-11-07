@@ -177,15 +177,8 @@ static void update_pass_context_from_context_json_in_cache(
   auto log_dir = context->get_log_dir();
   auto context_json_path = log_dir / "context.json";
   auto context_context_json = context->read_file_c8("context.json");
-  if (context_context_json) {
-    auto context_context_json_text = dos2unix(*context_context_json);
-    pass_context_update_context_json(*context, context_context_json_text);
-  } else if (std::filesystem::exists(context_json_path)) {
-    auto json_str = slurp(context_json_path);
-    pass_context_update_context_json(*context, json_str);
-  } else {
-    LOG(FATAL) << "cannot find context.json in the cache object.";
-  }
+  auto context_context_json_text = dos2unix(*context_context_json);
+  pass_context_update_context_json(*context, context_context_json_text);
 }
 
 static ContextProto load_context_json_2(PassContextImp& context) {
@@ -575,10 +568,6 @@ static std::string get_provider_option(const PassContextImp& context,
 static std::string get_ep_cache_context_embed_mode(PassContextImp& context) {
   auto measure_get_ep_cache_context_embed_mode =
       context.measure("get_ep_cache_context_embed_mode");
-  bool is_in_mem = context.cache_in_mem();
-  if (!is_in_mem) {
-    context.directory_to_cache_files(context.log_dir);
-  }
   auto bytes = context.cache_files_to_tar_mem();
   if (ENV_PARAM(XLNX_EP_CONTEXT_ENABLE_COMPRESSION)) {
     auto measure_compression = context.measure("vaip_core::compress");
@@ -609,10 +598,6 @@ static std::string get_ep_cache_context_nonembed_mode(PassContextImp& context) {
       << OrtSessionOptionEpContextFilePath.filename();
   auto OrtSessionOptionEpContextFilePath_binay =
       OrtSessionOptionEpContextFilePath.replace_extension(".bin");
-  bool is_in_mem = context.cache_in_mem();
-  if (!is_in_mem) {
-    context.directory_to_cache_files(context.log_dir);
-  }
   LOG_IF(INFO, ENV_PARAM(DEBUG_EP_CONTEXT))
       << "embed mode = 0, save cache directory to tar file "
       << OrtSessionOptionEpContextFilePath_binay.filename();
@@ -880,10 +865,6 @@ store_cache_directory_from_main_node(PassContextImp& context,
   }
   LOG_IF(INFO, ENV_PARAM(DEBUG_EP_CONTEXT))
       << " extract memory cache files to  " << context.get_log_dir();
-  bool is_in_mem = context.cache_in_mem();
-  if (!is_in_mem) {
-    context.cache_files_to_directory(context.get_log_dir());
-  }
 }
 
 static int64_t get_ep_context_index(const vaip_cxx::NodeConstRef& node) {
@@ -1422,6 +1403,9 @@ void restore_compilation_cache(const std::string& cache_dir,
                                const std::string& cache_data,
                                const std::string& model_path) {}
 thread_local const void* g_state = nullptr;
+thread_local vaip_core::DllSafe<std::string> (*g_get_config_entry)(
+    const void* state, const char* entry_name) = nullptr;
+
 int vitisai_ep_on_run_start(
     const std::vector<std::unique_ptr<vaip_core::ExecutionProvider>>& eps,
     const void* state,
@@ -1436,24 +1420,43 @@ int vitisai_ep_on_run_start(
       dynamic_cast<vaip_core::PassContextImp*>(ep->get_context().get());
   CHECK(p_context != nullptr);
   g_state = state;
-  p_context->get_run_options_ =
-      [get_config_entry](
-          const std::string& name) -> std::optional<std::string> {
-    auto dll_string = get_config_entry(g_state, name.data());
-    auto ret = std::optional<std::string>();
-    if (dll_string.get() != nullptr) {
-      ret = std::string(*dll_string);
-    }
-    return ret;
-  };
+  g_get_config_entry = get_config_entry;
+  return 0;
+}
+
+int vitisai_ep_set_ep_dynamic_options(
+    const std::vector<std::unique_ptr<vaip_core::ExecutionProvider>>& eps,
+    const char* const* keys, const char* const* values, size_t kv_len) {
+  if (eps.empty()) {
+    return 1;
+  }
+  auto ep =
+      dynamic_cast<vaip_core::ExecutionProviderConcrete*>(eps.front().get());
+  auto p_context =
+      dynamic_cast<vaip_core::PassContextImp*>(ep->get_context().get());
+  CHECK(p_context != nullptr);
+  std::lock_guard<std::mutex> lock(p_context->ep_dynamic_options_lock);
+  for (auto i = 0; i < kv_len; i++) {
+    auto key = std::string(keys[i]);
+    auto value = std::string(values[i]);
+    if (key == "ep.dynamic.workload_type")
+      p_context->update_all_qos(value);
+  }
   return 0;
 }
 } // namespace vaip_core
 
-extern "C" VAIP_DLL_SPEC int vitisai_ep_on_run_start(
+extern "C" VAIP_DLL_SPEC int vitisai_ep_on_run_start_c(
     const std::vector<std::unique_ptr<vaip_core::ExecutionProvider>>& eps,
     const void* state,
     vaip_core::DllSafe<std::string> (*get_config_entry)(
         const void* state, const char* entry_name)) {
   return vaip_core::vitisai_ep_on_run_start(eps, state, get_config_entry);
+}
+
+extern "C" VAIP_DLL_SPEC int vitisai_ep_set_ep_dynamic_options_c(
+    const std::vector<std::unique_ptr<vaip_core::ExecutionProvider>>& eps,
+    const char* const* keys, const char* const* values, size_t kv_len) {
+  return vaip_core::vitisai_ep_set_ep_dynamic_options(eps, keys, values,
+                                                      kv_len);
 }

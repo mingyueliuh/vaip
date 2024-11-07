@@ -316,12 +316,7 @@ void MyCustomOpGT1_3::LoadConstantsToWts(
     const std::shared_ptr<MetaDefProto>& meta_def) {
   std::vector<char> wts_file;
   auto wts_file_opt = context->read_file_c8("wts.bin");
-  if (wts_file_opt.has_value()) {
-    wts_file = wts_file_opt.value();
-  } else {
-    std::filesystem::path wtsFileFullName = context->get_log_dir() / "wts.bin";
-    wts_file = vaip_core::slurp_binary_c8(wtsFileFullName);
-  }
+  wts_file = wts_file_opt.value();
   auto const_info = meta_def->vaiml_param().const_data_info();
   wts_buffers_.resize(const_info.size());
   VAIML_DEBUG_PRINT("const_info.size(): ", const_info.size());
@@ -1469,6 +1464,7 @@ int32_t MyCustomOpGT1_3::MainBlockInputs(Ort::KernelContext& ctx) const {
     node_cache.erase("Slice");
     node_cache.erase("Slice_1");
   }
+  return 0;
 }
 
 int32_t MyCustomOpGT1_3::MainBlockOutputs(Ort::KernelContext& ctx) const {
@@ -1517,6 +1513,7 @@ int32_t MyCustomOpGT1_3::MainBlockOutputs(Ort::KernelContext& ctx) const {
     memcpy(data, ofm_ptr_ + GT_FRONT_SZ + 15 * 4300800,
            25 * 512 * sizeof(uint16_t));
   }
+  return 0;
 }
 
 void MyCustomOpGT1_3::Compute(const OrtApi* api,

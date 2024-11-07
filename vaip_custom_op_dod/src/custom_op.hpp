@@ -151,7 +151,6 @@ private:
   mutable bool share_context_;
   mutable std::string perf_pref_run_cached_;
   mutable std::string perf_pref_session_cached_;
-  uint32_t qos_priority_;
   std::shared_ptr<xrt::hw_context> hw_ctx_ptr_;
   // for XRT driver backward compatibility in non share context model
   bool support_eff_mode_;
